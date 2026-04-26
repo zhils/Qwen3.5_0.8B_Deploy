@@ -92,6 +92,9 @@ class CudaEngine {
     void forward_batch_prefill(const float* d_input, float* d_output, const int* positions,
                                int batch_size);
 
+    void forward_batch_prefill_graph(const float* d_input, float* d_output, const int* positions,
+                                     int batch_size);
+
     void forward_host(const std::vector<float>& input, std::vector<float>& output, int position);
 
     std::vector<float> get_output() const;
@@ -136,6 +139,12 @@ class CudaEngine {
     float* d_batch_output_buf_ = nullptr;
     int* d_positions_buf_ = nullptr;
     int max_batch_size_ = 0;
+
+    // CUDA Graph for prefill
+    cudaGraph_t prefill_graph_ = nullptr;
+    cudaGraphExec_t prefill_graph_exec_ = nullptr;
+    int prefill_graph_batch_size_ = 0;
+    bool prefill_graph_captured_ = false;
 
     size_t gpu_memory_bytes_;
     bool ready_;

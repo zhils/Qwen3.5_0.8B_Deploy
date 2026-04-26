@@ -221,7 +221,7 @@ static void run_v2_benchmark(const TestConfig& cfg) {
 
         CHECK_CUDA(cudaEventRecord(ev_start));
 
-        const int BATCH_SIZE = cfg.batch_size;
+        const int BATCH_SIZE = std::max(32, cfg.batch_size);
         int* d_batch_positions;
         CHECK_CUDA(cudaMalloc(&d_batch_positions, BATCH_SIZE * sizeof(int)));
         float* d_batch_input;
@@ -230,6 +230,7 @@ static void run_v2_benchmark(const TestConfig& cfg) {
         CHECK_CUDA(cudaMalloc(&d_batch_output, BATCH_SIZE * cfg.hidden_size * sizeof(float)));
 
         int prefill_pos = 0;
+        bool use_graph = false; // (BATCH_SIZE >= 32);
         while (prefill_pos < cfg.prefill_tokens) {
             int current_batch = std::min(BATCH_SIZE, cfg.prefill_tokens - prefill_pos);
 
@@ -245,8 +246,13 @@ static void run_v2_benchmark(const TestConfig& cfg) {
             CHECK_CUDA(cudaMemcpy(d_batch_positions, positions.data(),
                                   current_batch * sizeof(int), cudaMemcpyHostToDevice));
 
-            engine.forward_batch_prefill(d_batch_input, d_batch_output, positions.data(),
-                                         current_batch);
+            if (use_graph && current_batch == BATCH_SIZE) {
+                engine.forward_batch_prefill_graph(d_batch_input, d_batch_output, positions.data(),
+                                                   current_batch);
+            } else {
+                engine.forward_batch_prefill(d_batch_input, d_batch_output, positions.data(),
+                                             current_batch);
+            }
 
             if (prefill_pos + current_batch >= cfg.prefill_tokens || current_batch < BATCH_SIZE) {
                 CHECK_CUDA(cudaMemcpy(d_backbone_out,

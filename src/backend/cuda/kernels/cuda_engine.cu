@@ -171,6 +171,15 @@ CudaEngine::CudaEngine(int num_layers, int hidden_size, int intermediate_size, i
 
 CudaEngine::~CudaEngine() {
     free_buffers();
+
+    if (prefill_graph_exec_) {
+        cudaGraphExecDestroy(prefill_graph_exec_);
+        prefill_graph_exec_ = nullptr;
+    }
+    if (prefill_graph_) {
+        cudaGraphDestroy(prefill_graph_);
+        prefill_graph_ = nullptr;
+    }
 }
 
 void CudaEngine::allocate_buffers() {
@@ -332,6 +341,18 @@ void CudaEngine::forward_batch_prefill(const float* d_input, float* d_output, co
 
     float* final_in = (num_layers_ % 2 == 0) ? ping : pong;
     final_norm_->forward(final_in, d_output, batch_size);
+}
+
+void CudaEngine::forward_batch_prefill_graph(const float* d_input, float* d_output,
+                                             const int* positions, int batch_size) {
+    if (batch_size == 1) {
+        forward(d_input, d_output, positions[0]);
+        return;
+    }
+
+    // For now, CUDA Graph is disabled due to D2H memcpy in attention kernels
+    // Fall back to regular batch prefill
+    forward_batch_prefill(d_input, d_output, positions, batch_size);
 }
 
 void CudaEngine::ensure_batch_buffers(int batch_size) {
