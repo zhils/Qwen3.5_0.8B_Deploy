@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <vector>
 
 namespace qwen {
@@ -75,6 +76,18 @@ class CudaLinearAttention {
     mutable float* d_b_raw_buf_;
     mutable float* d_attn_out_buf_;
     mutable float* d_z_buf_;
+
+    cublasHandle_t cublas_handle_;
+
+    mutable float* d_batch_mixed_qkv_buf_;
+    mutable float* d_batch_conv_out_buf_;
+    mutable float* d_batch_a_buf_;
+    mutable float* d_batch_b_raw_buf_;
+    mutable float* d_batch_z_buf_;
+    mutable float* d_batch_attn_out_buf_;
+    mutable int max_batch_size_;
+
+    void ensure_batch_buffers(int batch_size) const;
 };
 
 } // namespace cuda

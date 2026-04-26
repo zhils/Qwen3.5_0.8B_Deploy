@@ -136,4 +136,7 @@ if(ENABLE_CUDA)
 
     add_executable(performance_test src/backend/cuda/performance_test.cu)
     target_link_libraries(performance_test PRIVATE qwen_cuda)
+
+    add_executable(verify_linear_attn_batch src/backend/cuda/verify_linear_attn_batch.cu)
+    target_link_libraries(verify_linear_attn_batch PRIVATE qwen_cuda)
 endif()
