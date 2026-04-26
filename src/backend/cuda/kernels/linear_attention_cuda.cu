@@ -393,9 +393,8 @@ void CudaLinearAttention::forward(const float* input, float* output,
 
     float* d_mixed_qkv = d_mixed_qkv_buf_;
     float* d_conv_out = d_conv_out_buf_;
-    float* d_q = d_q_buf_;
-    float* d_k = d_k_buf_;
-    float* d_v = d_v_buf_;
+    // Q, K, V pointers directly into conv_out buffer (no memcpy needed)
+    // d_q = d_conv_out, d_k = d_conv_out + num_heads * key_dim, d_v = d_conv_out + num_heads * key_dim + k_dim
     float* d_a = d_a_buf_;
     float* d_b_raw = d_b_raw_buf_;
 
@@ -411,16 +410,17 @@ void CudaLinearAttention::forward(const float* input, float* output,
                                                      d_conv1d_weight_, conv_dim, conv_kernel_);
     CUDA_CHECK_LAST_KERNEL();
 
-    cudaMemcpy(d_q, d_conv_out, num_heads_ * key_dim_ * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(d_k, d_conv_out + num_heads_ * key_dim_, k_dim * sizeof(float),
-               cudaMemcpyDeviceToDevice);
-    cudaMemcpy(d_v, d_conv_out + num_heads_ * key_dim_ + k_dim, v_dim * sizeof(float),
-               cudaMemcpyDeviceToDevice);
+    // Extract Q, K, V directly from conv_out without memcpy
+    // d_q = d_conv_out[0 : num_heads * key_dim]
+    // d_k = d_conv_out[num_heads * key_dim : num_heads * key_dim + k_dim]
+    // d_v = d_conv_out[num_heads * key_dim + k_dim : end]
 
     // Opt-5: Fused L2 norm Q+K — 1 kernel instead of 2
+    // Pass d_conv_out directly as q and k pointers with offsets
     const float l2norm_eps = 1e-6f;
     const float q_scale = 1.0f / std::sqrt(static_cast<float>(key_dim_));
-    l2norm_qk_fused_kernel<<<num_heads_, 1>>>(d_q, d_k, num_heads_, key_dim_, q_scale, l2norm_eps);
+    l2norm_qk_fused_kernel<<<num_heads_, 1>>>(d_conv_out, d_conv_out + num_heads_ * key_dim_,
+                                               num_heads_, key_dim_, q_scale, l2norm_eps);
     CUDA_CHECK_LAST_KERNEL();
 
     dim3 small_grid((num_heads_ + 255) / 256);
@@ -441,7 +441,10 @@ void CudaLinearAttention::forward(const float* input, float* output,
     dim3 update_grid(num_heads_);
     size_t shared_mem = (2 + 2 * value_dim_) * sizeof(float);
     gated_delta_kernel<<<update_grid, value_dim_, shared_mem>>>(
-        d_k, d_v, d_q, d_a, d_b_raw, d_a_log_, d_dt_bias_, state.d_recurrent_state, d_attn_out,
+        d_conv_out + num_heads_ * key_dim_,
+        d_conv_out + num_heads_ * key_dim_ + k_dim,
+        d_conv_out,
+        d_a, d_b_raw, d_a_log_, d_dt_bias_, state.d_recurrent_state, d_attn_out,
         num_heads_, key_dim_, value_dim_);
     CUDA_CHECK_LAST_KERNEL();
 

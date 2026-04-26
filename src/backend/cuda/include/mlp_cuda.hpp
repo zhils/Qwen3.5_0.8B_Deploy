@@ -33,6 +33,11 @@ class CudaMLP {
     float* d_down_proj_weight_;
 
     cublasHandle_t cublas_handle_;
+
+    mutable float* d_hidden_buf_;
+    mutable int max_hidden_batch_;
+
+    void ensure_hidden_buffer(int batch_size) const;
 };
 
 } // namespace cuda

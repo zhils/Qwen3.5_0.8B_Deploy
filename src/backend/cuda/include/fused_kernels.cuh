@@ -25,6 +25,13 @@ void launch_fused_gate_silu_mul(
     int intermediate_size,
     cudaStream_t stream = 0);
 
+void launch_silu_mul_batch(
+    const float* gate,
+    const float* up,
+    float* hidden,
+    int n,
+    cudaStream_t stream = 0);
+
 void launch_flash_attn_v2_prefill(
     const float* Q,
     const float* K_cache,

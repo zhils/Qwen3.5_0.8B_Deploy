@@ -74,24 +74,38 @@ __global__ void fused_gate_silu_mul_kernel(
     float* __restrict__ hidden,
     int hidden_size,
     int intermediate_size) {
-    
+
     const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx >= intermediate_size) return;
-    
+
     float g = 0.0f, u = 0.0f;
-    
+
     const float* g_w = gate_weight + idx * hidden_size;
     const float* u_w = up_weight + idx * hidden_size;
-    
+
 #pragma unroll 4
     for (int j = 0; j < hidden_size; ++j) {
         float x = input[j];
         g += g_w[j] * x;
         u += u_w[j] * x;
     }
-    
+
     float silu_g = g / (1.0f + expf(-g));
     hidden[idx] = silu_g * u;
+}
+
+__global__ void silu_mul_batch_kernel(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ hidden,
+    int n) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = gate[idx];
+    float silu_g = g / (1.0f + expf(-g));
+    hidden[idx] = silu_g * up[idx];
 }
 
 // ============================================================================
@@ -288,11 +302,23 @@ void launch_fused_gate_silu_mul(
     int hidden_size,
     int intermediate_size,
     cudaStream_t stream) {
-    
+
     const int block_size = 256;
     int grid_size = (intermediate_size + block_size - 1) / block_size;
     fused_gate_silu_mul_kernel<block_size><<<grid_size, block_size, 0, stream>>>(
         input, gate_weight, up_weight, hidden, hidden_size, intermediate_size);
+}
+
+void launch_silu_mul_batch(
+    const float* gate,
+    const float* up,
+    float* hidden,
+    int n,
+    cudaStream_t stream) {
+
+    const int block_size = 256;
+    int grid = (n + block_size - 1) / block_size;
+    silu_mul_batch_kernel<<<grid, block_size, 0, stream>>>(gate, up, hidden, n);
 }
 
 void launch_flash_attn_v2_prefill(
