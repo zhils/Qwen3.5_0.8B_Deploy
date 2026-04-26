@@ -10,7 +10,8 @@
 
 | 测试条件 | Prefill TTFT | Prefill 吞吐 | Decode TPOT | Decode 吞吐 | 端到端耗时 |
 |---------|-------------|-------------|-------------|-------------|-----------|
-| RTX 5060 Ti, prefill=1024, decode=512 | **1,948 ms** | **525.6 tok/s** | **0.062 ms/tok** | **16,248 tok/s** | **1,980 ms** |
+| RTX 5060 Ti, batch=128, prefill=1024, decode=512 | **1,948 ms** | **525.6 tok/s** | **0.062 ms/tok** | **16,248 tok/s** | **1,980 ms** |
+| RTX 5060 Ti, batch=1, prefill=1024, decode=512 | **2,305 ms** | **444.2 tok/s** | **0.062 ms/tok** | **16,133 tok/s** | **2,337 ms** |
 
 ### 与 llama.cpp 对比 (同硬件 RTX 5060 Ti)
 

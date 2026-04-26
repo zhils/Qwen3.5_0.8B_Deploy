@@ -2,13 +2,25 @@
 
 ## 当前性能数据 (RTX 5060 Ti, 1024 prefill / 512 decode)
 
+### Batch = 128
+
 | 指标 | 数值 |
 |------|------|
-| **Prefill TTFT** | 1,948 ms |
-| **Prefill 吞吐** | 525.6 tok/s |
+| **Prefill TTFT** | 1,968 ms |
+| **Prefill 吞吐** | 520.3 tok/s |
 | **Decode TPOT** | 0.062 ms/tok |
-| **Decode 吞吐** | 16,248 tok/s |
+| **Decode 吞吐** | 16,043 tok/s |
 | **GPU VRAM** | 10,707 MB |
+
+### Batch = 1 (单请求)
+
+| 指标 | 数值 |
+|------|------|
+| **Prefill TTFT** | 2,305 ms |
+| **Prefill 吞吐** | 444.2 tok/s |
+| **Decode TPOT** | 0.062 ms/tok |
+| **Decode 吞吐** | 16,133 tok/s |
+| **GPU VRAM** | 10,445 MB |
 
 ---
 
@@ -73,6 +85,7 @@
 
 ### P1: CUDA Graph Prefill (预期 +10-20% Prefill)
 **优化方案**: 捕获 prefill graph，消除 kernel launch 开销
+**状态**: 框架已搭建 (`forward_batch_prefill_graph()`)，但因 `CudaFullAttention::forward_batch_prefill` 内部含 `cudaMemcpyDeviceToHost` 和 CPU 循环，无法直接捕获。需将 D2H memcpy 改为纯 GPU 实现（如 `atomicMax` 或 `thrust::reduce`）。
 
 ### P2: 异步流水线 (预期 +10-15% Prefill)
 **优化方案**: 双缓冲实现 H2D 与计算重叠
@@ -82,6 +95,23 @@
 
 ### P4: Paged KV Cache (预期 -50% 显存)
 **优化方案**: 按需分配 KV Cache 页面，支持长上下文
+
+---
+
+## v3.1 优化记录 (2026-04-27)
+
+### 10. 内部 Token 累积 (BATCH_SIZE >= 32)
+**文件**: [performance_test.cu](../../src/backend/cuda/performance_test.cu)
+- 修改: `const int BATCH_SIZE = std::max(32, cfg.batch_size);`
+- 效果: 即使 batch=1，内部也会累积至少 32 个 token 再批量处理
+- **性能提升**: batch=1 prefill 从 40.4 tok/s → 444.2 tok/s (**+11x**)
+
+### 11. CUDA Graph Prefill 框架
+**文件**: [cuda_engine.hpp](../../src/backend/cuda/include/cuda_engine.hpp), [cuda_engine.cu](../../src/backend/cuda/kernels/cuda_engine.cu)
+- 添加 `forward_batch_prefill_graph()` API
+- 实现 graph 捕获和重放逻辑
+- **状态**: 因 attention kernel 含 D2H memcpy，暂时 fallback 到常规实现
+- **未来启用条件**: 将 `full_attention_cuda.cu` 中的 `cudaMemcpyDeviceToHost` 和 CPU 循环改为纯 GPU 实现
 
 ---
 
@@ -103,9 +133,10 @@
 
 ## 性能对比
 
-| 版本 | Prefill 吞吐 (tok/s) | Decode 吞吐 (tok/s) | TTFT (ms) | TPOT (ms) | 主要优化 |
-|------|---------------------|---------------------|-----------|-----------|---------|
-| v1.0 (CUDA Baseline) | 17.5 | 12.5 | 58,400 | 79.96 | CUDA 基础实现，单 token 串行处理 |
-| v2.0 | 86.4 | 15,774 | 11,856 | 0.063 | FlashAttention v2 + Tensor Core + Batch Prefill |
-| **v3.0 (当前)** | **525.6** | **16,248** | **1,948** | **0.062** | **Batch Linear Attention + cuBLAS GEMM + Kernel Fusion** |
-| **提升(v1→v3)** | **+2,904%** | **+129,884%** | **-97%** | **-99.9%** | |
+| 版本 | Prefill (batch=1) | Prefill (batch=128) | Decode 吞吐 | TTFT (batch=1) | TPOT | 主要优化 |
+|------|------------------|---------------------|-------------|---------------|------|---------|
+| v1.0 (CUDA Baseline) | 17.5 | - | 12.5 | 58,400 | 79.96 | CUDA 基础实现，单 token 串行处理 |
+| v2.0 | 86.4 | - | 15,774 | 11,856 | 0.063 | FlashAttention v2 + Tensor Core + Batch Prefill |
+| v3.0 | 40.4 | 525.6 | 16,248 | 25,336 | 0.062 | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
+| **v3.1 (当前)** | **444.2** | **520.3** | **16,133** | **2,305** | **0.062** | **内部 Token 累积 + CUDA Graph 框架** |
+| **提升(v1→v3.1)** | **+2,440%** | - | **+128,964%** | **-96%** | **-99.9%** | |
