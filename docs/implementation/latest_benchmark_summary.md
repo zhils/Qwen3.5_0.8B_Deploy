@@ -139,10 +139,9 @@ Clear/reclaim：
 
 | 版本 | Decode 吞吐 (tok/s) | 关键特性 |
 |------|---------------------|---------|
-| Baseline (CPU) | 2.9 | 原始 CPU 实现 |
-| GPU FP32 | 2,831 | 初始 GPU 实现 |
-| GPU INT8 KV | 4,735 | +INT8 KV Cache 量化 |
-| **v1.0 (当前)** | **12.5** | **简化版，移除预分配和 BF16** |
+| v1.0 (CUDA Baseline) | 12.5 | CUDA 基础实现，单 token 串行 |
+| v2.0 | 15,774 | FlashAttention v2 + Tensor Core + Batch Prefill |
+| **v3.0 (当前)** | **16,248** | **Batch Linear Attention + cuBLAS GEMM** |
 
 > 注：v1.0 decode 吞吐较低是因为测试的是端到端（含 prefill 后的 cache 状态），而历史数据是 pure decode 步骤。
 
@@ -176,23 +175,26 @@ Clear/reclaim：
 
 ### 6.4 性能对比总结
 
-| 版本 | Prefill 吞吐 (tok/s) | Decode 吞吐 (tok/s) | TTFT (ms) | TPOT (ms) |
-|------|---------------------|---------------------|-----------|-----------|
-| v1.0 | 17.5 | 12.5 | 58,400 | 79.96 |
-| **v2.0** | **86.4** | **15,774** | **11,856** | **0.063** |
-| **提升** | **+394%** | **+126,190%** | **-80%** | **-99.9%** |
+| 版本 | Prefill 吞吐 (tok/s) | Decode 吞吐 (tok/s) | TTFT (ms) | TPOT (ms) | 主要优化 |
+|------|---------------------|---------------------|-----------|-----------|---------|
+| v1.0 (CUDA Baseline) | 17.5 | 12.5 | 58,400 | 79.96 | CUDA 基础实现，单 token 串行 |
+| v2.0 | 86.4 | 15,774 | 11,856 | 0.063 | FlashAttention v2 + Tensor Core + Batch Prefill |
+| **v3.0 (当前)** | **525.6** | **16,248** | **1,948** | **0.062** | **Batch Linear Attention + cuBLAS GEMM + Kernel Fusion** |
+| **提升(v1→v3)** | **+2,904%** | **+129,884%** | **-97%** | **-99.9%** | |
 
 ### 6.5 优化效果分析
 
 1. **Prefill 阶段**:
    - v1.0: 逐 token 顺序处理，24,576 次 kernel launch
    - v2.0: Batch prefill + Flash Attention v2，大幅减少 launch 开销
-   - 效果: TTFT 从 58.4s 降至 11.9s，吞吐提升 394%
+   - v3.0: Batch Linear Attention + cuBLAS GEMM，projection 全部矩阵化
+   - 效果: TTFT 从 58.4s 降至 1.95s，吞吐提升 2,904%
 
 2. **Decode 阶段**:
    - v1.0: 动态内存分配，无优化
-   - v2.0: Flash Attention v2 + Tensor Core + Kernel Fusion
-   - 效果: TPOT 从 79.96ms 降至 0.063ms，吞吐提升 127,828%
+   - v2.0: Flash Attention v2 + Tensor Core + Kernel Fusion + CUDA Graph
+   - v3.0: 保持 v2.0 decode 优化，MLP 预分配 buffer
+   - 效果: TPOT 从 79.96ms 降至 0.062ms，吞吐提升 129,884%
 
 ## 7) 原始数据文件
 

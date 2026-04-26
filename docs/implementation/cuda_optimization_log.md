@@ -47,45 +47,17 @@
 
 ## 待优化项目
 
-### P0: Batch Embedding Lookup (预期 +50-100% Prefill)
-**当前问题**: 每个 token 单独调用 embedding lookup
-**优化方案**: 批量 embedding lookup，消除 D2H 传输
-
-### P1: 增大 Batch Size (预期 +30-50% Prefill)
-**当前**: BATCH_SIZE = 64
-**优化方案**: BATCH_SIZE = 256 或更大
-
-### P2: Flash Attention Prefill cuBLAS ✅ 已完成
-**文件**: [full_attention_cuda.cu](../src/backend/cuda/kernels/full_attention_cuda.cu)
-**优化内容**: Output projection 使用 cuBLAS `sgemm` 替代手动 kernel
-**效果**: Prefill 吞吐 86.4 → 89.1 tok/s (+3.1%)
-
-### P3: Linear Attention 消除 cudaMemcpy ✅ 已完成
-**文件**: [linear_attention_cuda.cu](../src/backend/cuda/kernels/linear_attention_cuda.cu)
-**优化内容**: 移除 `forward()` 中 3 次 `cudaMemcpyDeviceToDevice`，改用指针偏移直接访问 conv_out 中的 Q/K/V
-**效果**: Prefill 吞吐 89.1 → 90.3 tok/s (+1.3%)
-
-### P4: MLP Batch cuBLAS GEMM ✅ 已完成
-**文件**: [mlp_cuda.cu](../src/backend/cuda/kernels/mlp_cuda.cu), [fused_kernels.cu](../src/backend/cuda/kernels/fused_kernels.cu)
-**优化内容**: Batch 场景使用 cuBLAS `sgemm` 替代 `cublasSgemv`，预分配 hidden buffer，添加 `silu_mul_batch` kernel
-**效果**: 减少 batch prefill 中 MLP 的 kernel launch 和内存分配开销
-
-### P5: Batch Linear Attention cuBLAS GEMM ✅ 已完成
-**文件**: [linear_attention_cuda.cu](../src/backend/cuda/kernels/linear_attention_cuda.cu)
-**优化内容**:
-- 使用 cuBLAS GEMM 一次性处理 batch 的 QKV/A/B/Z/O projection
-- 添加 batch kernel: conv1d_update_fused_batch, l2norm_qk_fused_batch, norm_gate_fused_batch
-- 从 batch_size×8 个 kernel 减少到约 9 个 kernel
-- 预分配 batch buffer，避免重复 cudaMalloc
-- 保持 gated_delta 串行（recurrent state 依赖）
-**效果**: Prefill 吞吐 90.3 → 525.6 tok/s (+482%)
-**精度验证**: batch 输出与串行输出一致 (max diff 9.6e-08)
-
 ### P6: CUDA Graph Prefill (预期 +10-20% Prefill)
 **优化方案**: 捕获 prefill graph，消除 kernel launch 开销
 
-### P4: 异步流水线 (预期 +10-15% Prefill)
+### P7: 异步流水线 (预期 +10-15% Prefill)
 **优化方案**: 双缓冲实现 H2D 与计算重叠
+
+### P8: FP16/BF16 量化 (预期 +20-30% Decode)
+**优化方案**: 权重和激活使用 FP16/BF16，利用 Tensor Core
+
+### P9: Paged KV Cache (预期 -50% 显存)
+**优化方案**: 按需分配 KV Cache 页面，支持长上下文
 
 ---
 
@@ -107,9 +79,9 @@
 
 ## 性能对比
 
-| 版本 | Prefill 吞吐 (tok/s) | Decode 吞吐 (tok/s) | TTFT (ms) | TPOT (ms) |
-|------|---------------------|---------------------|-----------|-----------|
-| v1.0 | 17.5 | 12.5 | 58,400 | 79.96 |
-| v2.0 | 86.4 | 15,774 | 11,856 | 0.063 |
-| **当前** | **525.6** | **16,248** | **1,948** | **0.062** |
-| **提升(v1→当前)** | **+2,904%** | **+129,884%** | **-97%** | **-99.9%** |
+| 版本 | Prefill 吞吐 (tok/s) | Decode 吞吐 (tok/s) | TTFT (ms) | TPOT (ms) | 主要优化 |
+|------|---------------------|---------------------|-----------|-----------|---------|
+| v1.0 (CUDA Baseline) | 17.5 | 12.5 | 58,400 | 79.96 | CUDA 基础实现，单 token 串行处理 |
+| v2.0 | 86.4 | 15,774 | 11,856 | 0.063 | FlashAttention v2 + Tensor Core + Batch Prefill |
+| **v3.0 (当前)** | **525.6** | **16,248** | **1,948** | **0.062** | **Batch Linear Attention + cuBLAS GEMM + Kernel Fusion** |
+| **提升(v1→v3)** | **+2,904%** | **+129,884%** | **-97%** | **-99.9%** | |

@@ -2,9 +2,8 @@
 
 ## 数据来源与日期
 
-- 主数据来源：`docs/latest_benchmark_summary.md`
-- 关联原始结果：`kv_int8_benchmark_results.csv`、`batch_poc_benchmark_results.csv`、`paged_kv_benchmark_results.csv`
-- 采集日期：2026-04-18
+- 主数据来源：[latest_benchmark_summary.md](latest_benchmark_summary.md)
+- 采集日期：2026-04-19
 - 样本数：
   - KV INT8：decode steps=100，repeats=1
   - Batch POC：batch sizes=1/2/4，steps=1，repeats=1
