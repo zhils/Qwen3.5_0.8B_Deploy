@@ -4,11 +4,11 @@
 
 | 指标 | 数值 |
 |------|------|
-| **Prefill TTFT** | 11,495 ms |
-| **Prefill 吞吐** | 89.1 tok/s |
+| **Prefill TTFT** | 11,338 ms |
+| **Prefill 吞吐** | 90.3 tok/s |
 | **Decode TPOT** | 0.062 ms/tok |
-| **Decode 吞吐** | 16,191 tok/s |
-| **GPU VRAM** | 9,229 MB |
+| **Decode 吞吐** | 16,243 tok/s |
+| **GPU VRAM** | 9,373 MB |
 
 ---
 
@@ -60,7 +60,17 @@
 **优化内容**: Output projection 使用 cuBLAS `sgemm` 替代手动 kernel
 **效果**: Prefill 吞吐 86.4 → 89.1 tok/s (+3.1%)
 
-### P3: CUDA Graph Prefill (预期 +10-20% Prefill)
+### P3: Linear Attention 消除 cudaMemcpy ✅ 已完成
+**文件**: [linear_attention_cuda.cu](../src/backend/cuda/kernels/linear_attention_cuda.cu)
+**优化内容**: 移除 `forward()` 中 3 次 `cudaMemcpyDeviceToDevice`，改用指针偏移直接访问 conv_out 中的 Q/K/V
+**效果**: Prefill 吞吐 89.1 → 90.3 tok/s (+1.3%)
+
+### P4: MLP Batch cuBLAS GEMM ✅ 已完成
+**文件**: [mlp_cuda.cu](../src/backend/cuda/kernels/mlp_cuda.cu), [fused_kernels.cu](../src/backend/cuda/kernels/fused_kernels.cu)
+**优化内容**: Batch 场景使用 cuBLAS `sgemm` 替代 `cublasSgemv`，预分配 hidden buffer，添加 `silu_mul_batch` kernel
+**效果**: 减少 batch prefill 中 MLP 的 kernel launch 和内存分配开销
+
+### P5: CUDA Graph Prefill (预期 +10-20% Prefill)
 **优化方案**: 捕获 prefill graph，消除 kernel launch 开销
 
 ### P4: 异步流水线 (预期 +10-15% Prefill)
@@ -90,5 +100,5 @@
 |------|---------------------|---------------------|-----------|-----------|
 | v1.0 | 17.5 | 12.5 | 58,400 | 79.96 |
 | v2.0 | 86.4 | 15,774 | 11,856 | 0.063 |
-| **当前** | **89.1** | **16,191** | **11,495** | **0.062** |
-| **提升(v1→当前)** | **+409%** | **+129,428%** | **-80%** | **-99.9%** |
+| **当前** | **90.3** | **16,243** | **11,338** | **0.062** |
+| **提升(v1→当前)** | **+413%** | **+129,844%** | **-81%** | **-99.9%** |
