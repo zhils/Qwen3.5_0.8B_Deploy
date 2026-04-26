@@ -23,7 +23,11 @@
 | **端到端耗时 (1024+512)** | **1,980 ms** | **7,971 ms** | **4.0x** |
 | **显存占用** | 10,707 MB | 2,298 MB | - |
 
-> 注：llama.cpp 数据来自 [Qwen3.5-0.8B_Performance_Report.md](https://github.com/zhils/Qwen3.5_0.8B_Deploy/blob/main/docs/implementation/llama.cpp_Qwen3.5-0.8B_Performance_Report.md)，使用 `llama-bench` 实测，模型为 `qwen3.5-0.8b-f16.gguf` (BF16)，batch=1，`-ngl 99 -fa 1`，重复 20 次取 P50。本项目使用 FP32 权重，未做量化，batch_size=128。端到端耗时 = Prefill TTFT + Decode 耗时 (512 × 0.062ms ≈ 32ms)。
+> **测试条件说明**：
+> - llama.cpp：使用 `llama-bench` 实测，`qwen3.5-0.8b-f16.gguf` (BF16)，batch=1，`-ngl 99 -fa 1`，重复 20 次取 P50
+> - 本项目：FP32 权重，batch_size=128（仅影响 prefill），decode 为单 token 生成
+> - **Decode 差距说明**：84.7x 的差距主要来自 (1) 本项目启用 CUDA Graph 消除 kernel launch 开销；(2) 全融合 kernel（SiLU+Mul、RMSNorm+Residual 等）减少 HBM 访存；(3) 预分配 buffer 无动态内存分配。llama.cpp 作为通用框架，在 0.8B 小模型上 kernel launch 和框架开销占比较高。
+> - 端到端耗时 = Prefill TTFT + Decode 耗时 (512 × 0.062ms ≈ 32ms)
 
 ### 性能演进
 
