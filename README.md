@@ -8,9 +8,9 @@
 
 ### 核心性能指标
 
-| 测试条件 | Prefill TTFT | Prefill 吞吐 | Decode TPOT | Decode 吞吐 |
-|---------|-------------|-------------|-------------|-------------|
-| RTX 5060 Ti, prefill=1024, decode=512 | **1,948 ms** | **525.6 tok/s** | **0.062 ms/tok** | **16,248 tok/s** |
+| 测试条件 | Prefill TTFT | Prefill 吞吐 | Decode TPOT | Decode 吞吐 | 端到端耗时 |
+|---------|-------------|-------------|-------------|-------------|-----------|
+| RTX 5060 Ti, prefill=1024, decode=512 | **1,948 ms** | **525.6 tok/s** | **0.062 ms/tok** | **16,248 tok/s** | **1,980 ms** |
 
 ### 与 llama.cpp 对比 (同硬件 RTX 5060 Ti)
 
@@ -20,9 +20,10 @@
 | **Decode 吞吐** | **16,248 tok/s** | **191.79 t/s** | **84.7x** |
 | **Prefill TTFT (1024 tok)** | **1,948 ms** | **5,301 ms** | **2.7x** |
 | **Decode TPOT** | **0.062 ms** | **5.21 ms** | **84.0x** |
+| **端到端耗时 (1024+512)** | **1,980 ms** | **7,971 ms** | **4.0x** |
 | **显存占用** | 10,707 MB | 2,298 MB | - |
 
-> 注：llama.cpp 数据来自 [Qwen3.5-0.8B_Performance_Report.md](https://github.com/zhils/Qwen3.5_0.8B_Deploy/blob/main/docs/implementation/llama.cpp_Qwen3.5-0.8B_Performance_Report.md)，使用 `llama-bench` 实测，模型为 `qwen3.5-0.8b-f16.gguf` (BF16)，batch=1，`-ngl 99 -fa 1`，重复 20 次取 P50。本项目使用 FP32 权重，未做量化，batch_size=128。
+> 注：llama.cpp 数据来自 [Qwen3.5-0.8B_Performance_Report.md](https://github.com/zhils/Qwen3.5_0.8B_Deploy/blob/main/docs/implementation/llama.cpp_Qwen3.5-0.8B_Performance_Report.md)，使用 `llama-bench` 实测，模型为 `qwen3.5-0.8b-f16.gguf` (BF16)，batch=1，`-ngl 99 -fa 1`，重复 20 次取 P50。本项目使用 FP32 权重，未做量化，batch_size=128。端到端耗时 = Prefill TTFT + Decode 耗时 (512 × 0.062ms ≈ 32ms)。
 
 ### 性能演进
 
