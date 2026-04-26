@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+env:
+  # CUDA Toolkit version for self-hosted runners
+  CUDA_VERSION: "13.2"
+
+jobs:
+  # ============================================================
+  # Linux CPU Build (Community Runner)
+  # ============================================================
+  build-linux-cpu:
+    name: Build (Linux CPU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run Unit Tests
+        working-directory: build
+        run: ctest --output-on-failure -C Release -R "^unit_"
+
+  # ============================================================
+  # Windows Build (Can compile CUDA code, but cannot run GPU tests)
+  # Note: GitHub hosted runners do NOT have NVIDIA GPU
+  #       Use self-hosted runner with GPU for full CUDA testing
+  # ============================================================
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (CPU only)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+  # ============================================================
+  # Windows CUDA Build (Compile only - no GPU execution)
+  # ============================================================
+  build-windows-cuda:
+    name: Build (Windows CUDA)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (CUDA enabled)
+        run: cmake -S . -B build_cuda -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON
+
+      - name: Build
+        run: cmake --build build_cuda --config Release --parallel
+
+      # Note: Cannot run GPU executables - GitHub runners have no NVIDIA GPU
+      # For full CUDA testing, use self-hosted runner with GPU
+
+# =============================================================================
+# Alternative: Self-Hosted Runner Configuration (Uncomment and modify as needed)
+# =============================================================================
+# jobs:
+#   cuda-test:
+#     name: CUDA Tests (Self-Hosted)
+#     runs-on: [self-hosted, gpu]
+#     # Or specify your runner labels:
+#     # runs-on: [self-hosted, windows, gpu, cuda-13.2]
+#
+#     steps:
+#       - name: Checkout
+#         uses: actions/checkout@v4
+#
+#       - name: Configure CMake
+#         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON
+#
+#       - name: Build
+#         run: cmake --build build --config Release --parallel
+#
+#       - name: Run Benchmarks
+#         working-directory: build/Release
+#         run: |
+#           .\stage2_gpu_benchmark.exe .\weights 5
+#           .\kv_int8_benchmark.exe .\weights
+#
+#       - name: Run Integration Tests
+#         working-directory: build/Release
+#         run: |
+#           .\real_weights_compare.exe .\weights
+#           .\full_model_validate.exe .\weights

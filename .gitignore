@@ -1,0 +1,60 @@
+# Build artifacts
+build/
+build_cuda/
+build_phase3/
+build_ci_check/
+*.obj
+*.exe
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.log
+*.vcxproj
+*.vcxproj.filters
+*.slnx
+
+# Data files
+*.csv
+*.npy
+
+# Validation data directories
+debug_pytorch/
+debug_pytorch_bin/
+validation_data*/
+
+# Local model weights (large files)
+weights/hf/
+weights/**/*.bin
+
+# IDE / Editor
+.vs/
+.vscode/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Office temp files
+~$*.docx
+docs/resume_from_image.docx
+
+# Interview materials (private)
+interview/
+
+# Profiling artifacts
+*.ncu-rep
+*.nsys-rep
+
+# Performance charts (keep in root for quick access)
+# kv_memory_comparison.png
+# nsight_kv_int8_benchmark.png
+
+# Local private notes (do not track)
+docs/private_notes/
+
+# Archived files (not for interview)
+others/
+build_v2/
