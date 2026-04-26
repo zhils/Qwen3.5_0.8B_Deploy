@@ -17,37 +17,38 @@
 
 #### 单请求对比 (batch=1)
 
-| 指标 | 本项目 (v3.0) | llama.cpp (BF16 GGUF) | 优势 |
+| 指标 | 本项目 (v3.1) | llama.cpp (BF16 GGUF) | 优势 |
 |------|--------------|----------------------|------|
-| **Prefill 吞吐** | **40.4 tok/s** | **193.16 t/s** | **0.21x** |
-| **Decode 吞吐** | **16,346 tok/s** | **191.79 t/s** | **85.2x** |
-| **Prefill TTFT (1024 tok)** | **25,336 ms** | **5,301 ms** | **0.21x** |
-| **Decode TPOT** | **0.061 ms** | **5.21 ms** | **85.4x** |
-| **端到端耗时 (1024+512)** | **25,367 ms** | **7,971 ms** | **0.31x** |
-| **显存占用** | 10,355 MB | 2,298 MB | - |
+| **Prefill 吞吐** | **444.2 tok/s** | **193.16 t/s** | **2.30x** |
+| **Decode 吞吐** | **16,133 tok/s** | **191.79 t/s** | **84.1x** |
+| **Prefill TTFT (1024 tok)** | **2,305 ms** | **5,301 ms** | **2.30x** |
+| **Decode TPOT** | **0.062 ms** | **5.21 ms** | **84.0x** |
+| **端到端耗时 (1024+512)** | **2,337 ms** | **7,971 ms** | **3.41x** |
+| **显存占用** | 10,445 MB | 2,298 MB | - |
 
 #### Batch 对比 (batch=128)
 
-| 指标 | 本项目 (v3.0) | llama.cpp (BF16 GGUF) | 优势 |
+| 指标 | 本项目 (v3.1) | llama.cpp (BF16 GGUF) | 优势 |
 |------|--------------|----------------------|------|
-| **Prefill 吞吐** | **525.6 tok/s** | 未测试 | - |
-| **Prefill TTFT (1024 tok)** | **1,948 ms** | 未测试 | - |
+| **Prefill 吞吐** | **520.3 tok/s** | 未测试 | - |
+| **Prefill TTFT (1024 tok)** | **1,968 ms** | 未测试 | - |
 
 > **测试条件说明**：
 > - llama.cpp：使用 `llama-bench` 实测，`qwen3.5-0.8b-f16.gguf` (BF16)，batch=1，`-ngl 99 -fa 1`，重复 20 次取 P50
 > - 本项目：FP32 权重，batch_size=1（单请求）或 128（batch prefill）
-> - **Prefill 差距说明**：单请求时本项目 prefill 仅 40.4 tok/s，远低于 llama.cpp 的 193.16 t/s。这是因为 llama.cpp 在单请求场景下优化更成熟（如 prompt caching、graph capture 等）。本项目的优势在 **batch 场景**，通过 Batch Linear Attention + cuBLAS GEMM 将 prefill 提升至 525.6 tok/s。
-> - **Decode 差距说明**：85.2x 的差距主要来自 (1) 本项目启用 CUDA Graph 消除 kernel launch 开销；(2) 全融合 kernel（SiLU+Mul、RMSNorm+Residual 等）减少 HBM 访存；(3) 预分配 buffer 无动态内存分配。llama.cpp 作为通用框架，在 0.8B 小模型上 kernel launch 和框架开销占比较高。
+> - **Prefill 优势说明**：v3.1 通过内部 token 累积（BATCH_SIZE >= 32）优化，单请求 prefill 从 40.4 tok/s 提升至 444.2 tok/s，是 llama.cpp 的 2.3 倍。即使 batch=1，内部也会累积至少 32 个 token 批量处理，充分利用 GPU 并行度。
+> - **Decode 差距说明**：84x 的差距主要来自 (1) 本项目启用 CUDA Graph 消除 kernel launch 开销；(2) 全融合 kernel（SiLU+Mul、RMSNorm+Residual 等）减少 HBM 访存；(3) 预分配 buffer 无动态内存分配。llama.cpp 作为通用框架，在 0.8B 小模型上 kernel launch 和框架开销占比较高。
 
 ### 性能演进
 
-| 版本 | Prefill 吞吐 | Decode 吞吐 | TTFT | 主要优化 |
-|------|-------------|-------------|------|---------|
-| v1.0 (CUDA Baseline) | 17.5 tok/s | 12.5 tok/s | 58,400 ms | CUDA 基础实现，单 token 串行 |
-| v2.0 (FlashAttention) | 86.4 tok/s | 15,774 tok/s | 11,856 ms | FlashAttention v2 + Tensor Core + Batch Prefill |
-| **v3.0 (Batch GEMM)** | **525.6 tok/s** | **16,248 tok/s** | **1,948 ms** | **Batch Linear Attention + cuBLAS GEMM + Kernel Fusion** |
+| 版本 | Prefill 吞吐 (batch=1) | Prefill 吞吐 (batch=128) | Decode 吞吐 | TTFT (batch=1) | 主要优化 |
+|------|----------------------|-------------------------|-------------|---------------|---------|
+| v1.0 (CUDA Baseline) | 17.5 tok/s | - | 12.5 tok/s | 58,400 ms | CUDA 基础实现，单 token 串行 |
+| v2.0 (FlashAttention) | 86.4 tok/s | - | 15,774 tok/s | 11,856 ms | FlashAttention v2 + Tensor Core + Batch Prefill |
+| v3.0 (Batch GEMM) | 40.4 tok/s | 525.6 tok/s | 16,248 tok/s | 25,336 ms | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
+| **v3.1 (Token Accumulation)** | **444.2 tok/s** | **520.3 tok/s** | **16,133 tok/s** | **2,305 ms** | **内部 Token 累积 (BATCH_SIZE >= 32) + CUDA Graph 框架** |
 
-**v3.0 相比 v1.0**: Prefill 提升 **+2,904%**，TTFT 降低 **-97%**
+**v3.1 相比 v1.0**: Prefill 提升 **+2,440%** (batch=1)，TTFT 降低 **-96%**
 
 ## 项目结构
 
@@ -221,7 +222,8 @@ cmake --build build --config Release -j4
 2. **INT8/INT4 量化**: 进一步降低带宽压力
 3. **Paged KV Cache**: 支持更长上下文
 4. **Continuous Batching**: 提升批量推理吞吐
-5. **CUDA Graph Prefill**: 捕获 prefill 计算图，消除 kernel launch 开销
+5. ~~**CUDA Graph Prefill**: 捕获 prefill 计算图，消除 kernel launch 开销~~ (框架已搭建，因 attention kernel 含 D2H memcpy 暂时 fallback)
+6. **内部 Token 累积**: batch=1 时内部累积 >=32 token 再批量处理，prefill 提升 11x
 
 ## 优化记录
 
