@@ -37,15 +37,11 @@
 
 ### 性能优化与基准测试
 - [CUDA 优化日志](implementation/cuda_optimization_log.md) - 完整优化记录（推荐）
-- [最新基准测试摘要](implementation/latest_benchmark_summary.md) - 最新性能数据
-- [内存优化报告](implementation/memory_optimization_report.md) - 内存使用优化
-- [BF16 GEMM 基准测试](implementation/bf16_prefill_benchmark.md) - BF16 矩阵乘法
-- [KV INT8 基准测试](implementation/kv_int8_benchmark.md) - INT8 量化 KV Cache
-- [Paged KV 基准测试](implementation/paged_kv_benchmark.md) - Paged KV Cache
+- [BF16 GEMM 基准测试](implementation/bf16_prefill_benchmark.md) - BF16 矩阵乘法（已归档）
+- [Batch POC 基准测试](implementation/batch_poc_benchmark.md) - 批处理 POC 测试（已归档）
 - [基准测试自动化](implementation/benchmark_automation_principle_and_implementation.md) - 自动化测试框架
 
 ### 开发与调试
-- [代码规范](implementation/code_style_guide.md) - 编码规范和最佳实践
 - [精度验证方法](implementation/accuracy_validation_methodology.md) - 精度验证流程
 - [项目结构规范](implementation/项目结构体设计规范.md) - 代码组织规范
 
@@ -58,16 +54,12 @@ docs/
 ├── README.md                          # 本文档（统一入口）
 ├── implementation/                    # 实现相关文档
 │   ├── cuda_optimization_log.md       # CUDA 优化详细记录（核心文档）
-│   ├── latest_benchmark_summary.md    # 最新基准测试摘要
-│   ├── memory_optimization_report.md  # 内存优化报告
 │   ├── qwen3_5_0_8b_architecture.md   # 项目架构概览
-│   ├── code_style_guide.md            # 代码规范
 │   ├── accuracy_validation_methodology.md  # 精度验证方法
-│   ├── bf16_prefill_benchmark.md      # BF16 基准测试
-│   ├── kv_int8_benchmark.md           # KV INT8 基准测试
-│   ├── paged_kv_benchmark.md          # Paged KV 基准测试
-│   ├── batch_poc_benchmark.md         # 批处理 POC 测试
-│   └── benchmark_automation_principle_and_implementation.md  # 自动化测试
+│   ├── bf16_prefill_benchmark.md      # BF16 基准测试（已归档）
+│   ├── batch_poc_benchmark.md         # 批处理 POC 测试（已归档）
+│   ├── benchmark_automation_principle_and_implementation.md  # 自动化测试
+│   └── 项目结构体设计规范.md          # 代码组织规范
 └── qwen3_5_0_8b_details/              # 模型架构详解
     ├── 00_总览与索引.md
     ├── 01_总体架构_实现级流程.md
@@ -96,9 +88,8 @@ docs/
 
 ### 路径 3：性能优化（适合优化工程师）
 1. [CUDA 优化日志](implementation/cuda_optimization_log.md)
-2. [最新基准测试摘要](implementation/latest_benchmark_summary.md)
-3. [内存优化报告](implementation/memory_optimization_report.md)
-4. [BF16 GEMM 基准测试](implementation/bf16_prefill_benchmark.md)
+2. [BF16 GEMM 基准测试](implementation/bf16_prefill_benchmark.md)（已归档）
+3. [Batch POC 基准测试](implementation/batch_poc_benchmark.md)（已归档）
 
 ---
 
