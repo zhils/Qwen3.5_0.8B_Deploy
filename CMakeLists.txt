@@ -110,10 +110,6 @@ if(ENABLE_CUDA)
         src/backend/cuda/kernels/vision_patch_embedding_cuda.cu
         src/backend/cuda/kernels/fa_wrapper.cpp
         src/backend/cuda/kernels/fa_set_weights.cu
-        src/backend/cuda/kernels/v2_tensor_core.cu
-        src/backend/cuda/kernels/v2_flash_attention.cu
-        src/backend/cuda/kernels/v2_paged_kv.cu
-        src/backend/cuda/kernels/v2_async_streams.cu
         src/backend/cuda/kernels/fused_kernels.cu
     )
 
@@ -137,6 +133,6 @@ if(ENABLE_CUDA)
         CUDA_SEPARABLE_COMPILATION OFF
     )
 
-    add_executable(v2_performance_test src/backend/cuda/v2_performance_test.cu)
-    target_link_libraries(v2_performance_test PRIVATE qwen_cuda)
+    add_executable(performance_test src/backend/cuda/performance_test.cu)
+    target_link_libraries(performance_test PRIVATE qwen_cuda)
 endif()

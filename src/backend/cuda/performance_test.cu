@@ -54,6 +54,7 @@ struct TestConfig {
     int prefill_tokens = 1024;
     int decode_tokens = 512;
     int num_rounds = 5;
+    int batch_size = 128;
 };
 
 struct LatencyStats {
@@ -179,6 +180,7 @@ static void run_v2_benchmark(const TestConfig& cfg) {
     std::cout << std::string(72, '=') << std::endl;
     std::cout << "  Prefill tokens:     " << cfg.prefill_tokens << std::endl;
     std::cout << "  Decode tokens:      " << cfg.decode_tokens << std::endl;
+    std::cout << "  Batch size:         " << cfg.batch_size << std::endl;
     std::cout << "  Rounds:             " << cfg.num_rounds << std::endl;
 
     CudaEngine engine(cfg.num_layers, cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size,
@@ -219,11 +221,9 @@ static void run_v2_benchmark(const TestConfig& cfg) {
 
         CHECK_CUDA(cudaEventRecord(ev_start));
 
-        const int BATCH_SIZE = 64;
-        float* h_batch_input = nullptr;
-        int* h_positions = nullptr;
-        CHECK_CUDA(cudaMallocHost(&h_batch_input, BATCH_SIZE * cfg.hidden_size * sizeof(float)));
-        CHECK_CUDA(cudaMallocHost(&h_positions, BATCH_SIZE * sizeof(int)));
+        const int BATCH_SIZE = cfg.batch_size;
+        int* d_batch_positions;
+        CHECK_CUDA(cudaMalloc(&d_batch_positions, BATCH_SIZE * sizeof(int)));
         float* d_batch_input;
         float* d_batch_output;
         CHECK_CUDA(cudaMalloc(&d_batch_input, BATCH_SIZE * cfg.hidden_size * sizeof(float)));
@@ -233,20 +233,19 @@ static void run_v2_benchmark(const TestConfig& cfg) {
         while (prefill_pos < cfg.prefill_tokens) {
             int current_batch = std::min(BATCH_SIZE, cfg.prefill_tokens - prefill_pos);
 
+            std::vector<int> token_ids(current_batch);
+            std::vector<int> positions(current_batch);
             for (int b = 0; b < current_batch; ++b) {
-                int token_id = 151644 + ((prefill_pos + b) % 100);
-                emb.forward(token_id, d_emb);
-                CHECK_CUDA(cudaMemcpy(h_batch_input + b * cfg.hidden_size,
-                                      d_emb, cfg.hidden_size * sizeof(float),
-                                      cudaMemcpyDeviceToHost));
-                h_positions[b] = prefill_pos + b;
+                token_ids[b] = 151644 + ((prefill_pos + b) % 100);
+                positions[b] = prefill_pos + b;
             }
 
-            CHECK_CUDA(cudaMemcpy(d_batch_input, h_batch_input,
-                                  current_batch * cfg.hidden_size * sizeof(float),
-                                  cudaMemcpyHostToDevice));
+            emb.forward(token_ids, d_batch_input);
 
-            engine.forward_batch_prefill(d_batch_input, d_batch_output, h_positions,
+            CHECK_CUDA(cudaMemcpy(d_batch_positions, positions.data(),
+                                  current_batch * sizeof(int), cudaMemcpyHostToDevice));
+
+            engine.forward_batch_prefill(d_batch_input, d_batch_output, positions.data(),
                                          current_batch);
 
             if (prefill_pos + current_batch >= cfg.prefill_tokens || current_batch < BATCH_SIZE) {
@@ -269,8 +268,7 @@ static void run_v2_benchmark(const TestConfig& cfg) {
 
         cudaFree(d_batch_input);
         cudaFree(d_batch_output);
-        cudaFreeHost(h_batch_input);
-        cudaFreeHost(h_positions);
+        cudaFree(d_batch_positions);
 
         int position = cfg.prefill_tokens;
         for (int step = 0; step < cfg.decode_tokens; ++step) {
@@ -331,6 +329,7 @@ int main(int argc, char** argv) {
     if (argc > 1) cfg.prefill_tokens = std::atoi(argv[1]);
     if (argc > 2) cfg.decode_tokens = std::atoi(argv[2]);
     if (argc > 3) cfg.num_rounds = std::atoi(argv[3]);
+    if (argc > 4) cfg.batch_size = std::atoi(argv[4]);
 
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));

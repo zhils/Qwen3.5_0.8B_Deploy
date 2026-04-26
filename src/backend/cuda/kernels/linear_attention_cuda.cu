@@ -458,5 +458,20 @@ void CudaLinearAttention::forward(const float* input, float* output,
     CUDA_CHECK_LAST_KERNEL();
 }
 
+void CudaLinearAttention::forward_batch(const float* input, float* output, CudaLinearAttnState& state,
+                                        int batch_size) const {
+    for (int b = 0; b < batch_size; ++b) {
+        forward(input + b * hidden_size_, output + b * hidden_size_, state);
+    }
+}
+
+void CudaLinearAttention::forward_batch_streamed(const float* input, float* output,
+                                                  CudaLinearAttnState& state, int batch_size,
+                                                  cudaStream_t stream) const {
+    for (int b = 0; b < batch_size; ++b) {
+        forward(input + b * hidden_size_, output + b * hidden_size_, state);
+    }
+}
+
 } // namespace cuda
 } // namespace qwen

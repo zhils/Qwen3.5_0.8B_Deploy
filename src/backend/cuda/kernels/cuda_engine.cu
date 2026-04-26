@@ -132,10 +132,7 @@ void CudaLayer::forward_batch_prefill(const float* d_input, float* d_output,
     input_norm_->forward(d_input, d_normed_input_buf, batch_size);
 
     if (is_linear_) {
-        for (int b = 0; b < batch_size; ++b) {
-            linear_attn_->forward(d_normed_input_buf + b * config_.hidden_size,
-                                  d_attn_out_buf + b * config_.hidden_size, lin_state);
-        }
+        linear_attn_->forward_batch(d_normed_input_buf, d_attn_out_buf, lin_state, batch_size);
     } else {
         full_attn_->forward_batch_prefill(d_normed_input_buf, d_attn_out_buf, kv_cache, layer_idx_,
                                           positions, batch_size);

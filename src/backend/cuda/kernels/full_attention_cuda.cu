@@ -146,7 +146,11 @@ CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_
     : hidden_size_(hidden_size), num_heads_(num_heads), num_kv_heads_(num_kv_heads),
       q_head_dim_(q_head_dim), kv_head_dim_(kv_head_dim), d_q_proj_weight_(nullptr),
       d_k_proj_weight_(nullptr), d_v_proj_weight_(nullptr), d_o_proj_weight_(nullptr),
-      d_q_norm_weight_(nullptr), d_k_norm_weight_(nullptr) {
+      d_q_norm_weight_(nullptr), d_k_norm_weight_(nullptr), d_q_buf_(nullptr),
+      d_gate_buf_(nullptr), d_k_buf_(nullptr), d_v_buf_(nullptr), d_attn_out_buf_(nullptr),
+      d_attn_scores_buf_(nullptr), max_seq_len_(8192), d_batch_q_buf_(nullptr),
+      d_batch_gate_buf_(nullptr), d_batch_k_buf_(nullptr), d_batch_v_buf_(nullptr),
+      d_batch_attn_out_buf_(nullptr), max_batch_size_(0) {
     int total_q = num_heads_ * q_head_dim_;
     int total_kv = num_kv_heads_ * kv_head_dim_;
     int total_out = num_heads_ * kv_head_dim_;
@@ -158,7 +162,6 @@ CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_
     cudaMalloc(&d_q_norm_weight_, static_cast<size_t>(kv_head_dim_) * sizeof(float));
     cudaMalloc(&d_k_norm_weight_, static_cast<size_t>(kv_head_dim_) * sizeof(float));
 
-    max_seq_len_ = 8192;
     cudaMalloc(&d_q_buf_, static_cast<size_t>(total_q) * sizeof(float));
     cudaMalloc(&d_gate_buf_, static_cast<size_t>(total_q) * sizeof(float));
     cudaMalloc(&d_k_buf_, static_cast<size_t>(total_kv) * sizeof(float));
