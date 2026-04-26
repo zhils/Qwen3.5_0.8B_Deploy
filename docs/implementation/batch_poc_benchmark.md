@@ -1,5 +1,7 @@
 # Batch 推理优化 Benchmark 报告
 
+> **状态**: 已归档。当前项目已采用更高效的 Batch Linear Attention + cuBLAS GEMM 方案，本报告中的 POC 数据仅供参考。
+
 ## 数据来源与日期
 
 - 数据来源：`./build/Release/batch_opt_benchmark.exe 100 1 2 4`
@@ -96,3 +98,13 @@
 3. **P95 尾延迟稳定**，无异常抖动
 4. **核心优化是连续内存布局 + 合并 launch**，消除同步的贡献在此 workload 下较小
 
+---
+
+## 后续演进
+
+当前项目已采用更激进的优化方案：
+- **Batch Linear Attention**: 使用 cuBLAS GEMM 一次性处理所有 projection
+- **Kernel Fusion**: 将多个小 kernel 合并为单个 fused kernel
+- **预分配 Buffer**: 避免重复的 cudaMalloc/Free
+
+详见 [cuda_optimization_log.md](cuda_optimization_log.md)

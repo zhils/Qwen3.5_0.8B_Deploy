@@ -214,18 +214,5 @@ flowchart TD
 1. 上图基于你本地权重结构与配置文件，不是通用“猜测图”。
 2. 对 LinearAttention 的内部数学细节，官方代码中可能还有实现级优化（如张量重排、缓存策略）；本图按权重命名与结构配置还原主要连接过程。
 
----
 
-## 10) 实现级细分文档
-
-已生成更细的模块拆解文档（用于直接写代码和加载参数）：
-
-- `qwen3_5_0_8b_details/00_总览与索引.md`
-- `qwen3_5_0_8b_details/01_总体架构_实现级流程.md`
-- `qwen3_5_0_8b_details/02_文本主干_24层调度与参数映射.md`
-- `qwen3_5_0_8b_details/03_LinearAttention_GatedDeltaNet_细节.md`
-- `qwen3_5_0_8b_details/04_FullAttention_GQA_RoPE_细节.md`
-- `qwen3_5_0_8b_details/05_MLP_层归一化_输出头.md`
-- `qwen3_5_0_8b_details/06_视觉编码器与Merger_细节.md`
-- `qwen3_5_0_8b_details/07_MTP分支与推测解码_参数加载.md`
 

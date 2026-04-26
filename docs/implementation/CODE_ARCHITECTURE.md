@@ -126,11 +126,10 @@ void CudaFullAttention::forward(const float* input, float* output, CudaKVCache& 
 void CudaLinearAttention::forward(const float* input, float* output, CudaLinearAttnState& state);
 ```
 
-**核心逻辑**:
-1. Mixed QKV投影
-2. Conv1D处理
-3. 状态更新: `state = state + conv_out @ conv_out.T`
-4. 输出计算: `output = state @ conv_out`
+**v3.0 Batch 优化**:
+- cuBLAS GEMM 一次性处理 batch 的 QKV/A/B/Z/O projection
+- Batch kernel: conv1d_update_fused_batch, l2norm_qk_fused_batch, norm_gate_fused_batch
+- Kernel launch 从 batch_size×8 减少到约 9 个
 
 ### 3.3 mlp_cuda.cu
 
