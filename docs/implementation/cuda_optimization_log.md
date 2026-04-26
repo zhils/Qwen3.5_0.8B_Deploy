@@ -4,11 +4,11 @@
 
 | 指标 | 数值 |
 |------|------|
-| **Prefill TTFT** | 11,338 ms |
-| **Prefill 吞吐** | 90.3 tok/s |
+| **Prefill TTFT** | 1,948 ms |
+| **Prefill 吞吐** | 525.6 tok/s |
 | **Decode TPOT** | 0.062 ms/tok |
-| **Decode 吞吐** | 16,243 tok/s |
-| **GPU VRAM** | 9,373 MB |
+| **Decode 吞吐** | 16,248 tok/s |
+| **GPU VRAM** | 10,707 MB |
 
 ---
 
@@ -70,7 +70,18 @@
 **优化内容**: Batch 场景使用 cuBLAS `sgemm` 替代 `cublasSgemv`，预分配 hidden buffer，添加 `silu_mul_batch` kernel
 **效果**: 减少 batch prefill 中 MLP 的 kernel launch 和内存分配开销
 
-### P5: CUDA Graph Prefill (预期 +10-20% Prefill)
+### P5: Batch Linear Attention cuBLAS GEMM ✅ 已完成
+**文件**: [linear_attention_cuda.cu](../src/backend/cuda/kernels/linear_attention_cuda.cu)
+**优化内容**:
+- 使用 cuBLAS GEMM 一次性处理 batch 的 QKV/A/B/Z/O projection
+- 添加 batch kernel: conv1d_update_fused_batch, l2norm_qk_fused_batch, norm_gate_fused_batch
+- 从 batch_size×8 个 kernel 减少到约 9 个 kernel
+- 预分配 batch buffer，避免重复 cudaMalloc
+- 保持 gated_delta 串行（recurrent state 依赖）
+**效果**: Prefill 吞吐 90.3 → 525.6 tok/s (+482%)
+**精度验证**: batch 输出与串行输出一致 (max diff 9.6e-08)
+
+### P6: CUDA Graph Prefill (预期 +10-20% Prefill)
 **优化方案**: 捕获 prefill graph，消除 kernel launch 开销
 
 ### P4: 异步流水线 (预期 +10-15% Prefill)
@@ -100,5 +111,5 @@
 |------|---------------------|---------------------|-----------|-----------|
 | v1.0 | 17.5 | 12.5 | 58,400 | 79.96 |
 | v2.0 | 86.4 | 15,774 | 11,856 | 0.063 |
-| **当前** | **90.3** | **16,243** | **11,338** | **0.062** |
-| **提升(v1→当前)** | **+413%** | **+129,844%** | **-81%** | **-99.9%** |
+| **当前** | **525.6** | **16,248** | **1,948** | **0.062** |
+| **提升(v1→当前)** | **+2,904%** | **+129,884%** | **-97%** | **-99.9%** |
