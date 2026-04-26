@@ -39,8 +39,7 @@ class CudaLinearAttention {
     void forward_batch(const float* input, float* output, CudaLinearAttnState& state,
                        int batch_size) const;
 
-    void forward_batch_streamed(const float* input, float* output, CudaLinearAttnState& state,
-                                int batch_size, cudaStream_t stream) const;
+    void forward_fused(const float* input, float* output, CudaLinearAttnState& state) const;
 
     int hidden_size() const {
         return hidden_size_;

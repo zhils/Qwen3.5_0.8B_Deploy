@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <stdexcept>
 
 #define FA_CUDA_CHECK()                                                                            \
     {                                                                                              \
@@ -12,6 +13,15 @@
             printf("FA Kernel Error: %s\n", cudaGetErrorString(_err));                             \
         }                                                                                          \
     }
+
+#define FA_CUBLAS_CHECK(call)                                                                      \
+    do {                                                                                           \
+        cublasStatus_t _err = (call);                                                              \
+        if (_err != CUBLAS_STATUS_SUCCESS) {                                                       \
+            fprintf(stderr, "cuBLAS error %d at %s:%d\n", static_cast<int>(_err), __FILE__, __LINE__); \
+            exit(1);                                                                               \
+        }                                                                                          \
+    } while (0)
 
 namespace qwen {
 namespace cuda {
@@ -150,7 +160,7 @@ CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_
       d_gate_buf_(nullptr), d_k_buf_(nullptr), d_v_buf_(nullptr), d_attn_out_buf_(nullptr),
       d_attn_scores_buf_(nullptr), max_seq_len_(8192), d_batch_q_buf_(nullptr),
       d_batch_gate_buf_(nullptr), d_batch_k_buf_(nullptr), d_batch_v_buf_(nullptr),
-      d_batch_attn_out_buf_(nullptr), max_batch_size_(0) {
+      d_batch_attn_out_buf_(nullptr), max_batch_size_(0), cublas_handle_(nullptr) {
     int total_q = num_heads_ * q_head_dim_;
     int total_kv = num_kv_heads_ * kv_head_dim_;
     int total_out = num_heads_ * kv_head_dim_;
@@ -168,6 +178,9 @@ CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_
     cudaMalloc(&d_v_buf_, static_cast<size_t>(total_kv) * sizeof(float));
     cudaMalloc(&d_attn_out_buf_, static_cast<size_t>(total_out) * sizeof(float));
     cudaMalloc(&d_attn_scores_buf_, static_cast<size_t>(num_heads_) * max_seq_len_ * sizeof(float));
+
+    FA_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
+    FA_CUBLAS_CHECK(cublasSetMathMode(cublas_handle_, CUBLAS_TF32_TENSOR_OP_MATH));
 }
 
 CudaFullAttention::~CudaFullAttention() {
@@ -195,6 +208,8 @@ CudaFullAttention::~CudaFullAttention() {
         cudaFree(d_attn_out_buf_);
     if (d_attn_scores_buf_)
         cudaFree(d_attn_scores_buf_);
+    if (cublas_handle_)
+        cublasDestroy(cublas_handle_);
 }
 
 void CudaFullAttention::set_weights(const std::vector<float>& q_proj_weight,
@@ -538,10 +553,15 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
         d_batch_attn_out_buf_, d_batch_gate_buf_, num_heads_, kv_head_dim_, q_head_dim_, batch_size);
     FA_CUDA_CHECK();
 
-    dim3 proj_grid((hidden_size_ + 255) / 256, batch_size);
-    batch_output_proj_kernel<<<proj_grid, 256>>>(
-        d_batch_attn_out_buf_, output, d_o_proj_weight_, total_out, hidden_size_, batch_size);
-    FA_CUDA_CHECK();
+    // Use cuBLAS GEMM for output projection: output = attn_out × o_weight^T
+    // attn_out: [batch_size, total_out], o_weight: [hidden_size, total_out]
+    // output = attn_out × o_weight^T  =>  [batch_size, total_out] × [total_out, hidden_size]
+    const float alpha = 1.0f, beta = 0.0f;
+    FA_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+                                hidden_size_, batch_size, total_out,
+                                &alpha, d_o_proj_weight_, total_out,
+                                d_batch_attn_out_buf_, total_out,
+                                &beta, output, hidden_size_));
 }
 
 } // namespace cuda

@@ -111,6 +111,7 @@ if(ENABLE_CUDA)
         src/backend/cuda/kernels/fa_wrapper.cpp
         src/backend/cuda/kernels/fa_set_weights.cu
         src/backend/cuda/kernels/fused_kernels.cu
+        src/backend/cuda/kernels/linear_attention_fused.cu
     )
 
     add_library(qwen_cuda STATIC ${CUDA_KERNEL_SOURCES})

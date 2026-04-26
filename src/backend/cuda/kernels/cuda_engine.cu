@@ -144,6 +144,8 @@ void CudaLayer::forward_batch_prefill(const float* d_input, float* d_output,
     mlp_->forward_add_residual(d_post_normed_buf, d_output, batch_size);
 }
 
+
+
 CudaEngine::CudaEngine(int num_layers, int hidden_size, int intermediate_size, int vocab_size,
                        int max_seq_len)
     : num_layers_(num_layers), hidden_size_(hidden_size), intermediate_size_(intermediate_size),

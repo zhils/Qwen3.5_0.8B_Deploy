@@ -4,11 +4,11 @@
 
 | 指标 | 数值 |
 |------|------|
-| **Prefill TTFT** | 11,856 ms |
-| **Prefill 吞吐** | 86.4 tok/s |
-| **Decode TPOT** | 0.063 ms/tok |
-| **Decode 吞吐** | 15,774 tok/s |
-| **GPU VRAM** | 8,833 MB |
+| **Prefill TTFT** | 11,495 ms |
+| **Prefill 吞吐** | 89.1 tok/s |
+| **Decode TPOT** | 0.062 ms/tok |
+| **Decode 吞吐** | 16,191 tok/s |
+| **GPU VRAM** | 9,229 MB |
 
 ---
 
@@ -26,12 +26,13 @@
 - GEMM acceleration for MLP projections
 
 ### 3. Kernel Fusion
-**文件**: [fused_kernels.cu](../src/backend/cuda/kernels/fused_kernels.cu)
+**文件**: [fused_kernels.cu](../src/backend/cuda/kernels/fused_kernels.cu), [linear_attention_fused.cu](../src/backend/cuda/kernels/linear_attention_fused.cu)
 - Gate + SiLU + Mul fusion
 - RMSNorm + Residual fusion
 - Conv1D + State update fusion
 - L2 norm Q + K fusion
 - Norm + Gate fusion
+- Linear Attention 全融合内核 (forward_fused): 将 projection、conv1d、norm、gated delta、output projection 合并为单个 kernel
 
 ### 4. Batch Prefill
 **文件**: [full_attention_cuda.cu](../src/backend/cuda/kernels/full_attention_cuda.cu)
@@ -54,9 +55,10 @@
 **当前**: BATCH_SIZE = 64
 **优化方案**: BATCH_SIZE = 256 或更大
 
-### P2: Flash Attention Prefill cuBLAS (预期 +20-30% Prefill)
-**当前**: 手动矩阵乘法
-**优化方案**: 使用 cuBLAS GEMM 进行批量矩阵乘法
+### P2: Flash Attention Prefill cuBLAS ✅ 已完成
+**文件**: [full_attention_cuda.cu](../src/backend/cuda/kernels/full_attention_cuda.cu)
+**优化内容**: Output projection 使用 cuBLAS `sgemm` 替代手动 kernel
+**效果**: Prefill 吞吐 86.4 → 89.1 tok/s (+3.1%)
 
 ### P3: CUDA Graph Prefill (预期 +10-20% Prefill)
 **优化方案**: 捕获 prefill graph，消除 kernel launch 开销
@@ -87,5 +89,6 @@
 | 版本 | Prefill 吞吐 (tok/s) | Decode 吞吐 (tok/s) | TTFT (ms) | TPOT (ms) |
 |------|---------------------|---------------------|-----------|-----------|
 | v1.0 | 17.5 | 12.5 | 58,400 | 79.96 |
-| **当前** | **86.4** | **15,774** | **11,856** | **0.063** |
-| **提升** | **+394%** | **+126,190%** | **-80%** | **-99.9%** |
+| v2.0 | 86.4 | 15,774 | 11,856 | 0.063 |
+| **当前** | **89.1** | **16,191** | **11,495** | **0.062** |
+| **提升(v1→当前)** | **+409%** | **+129,428%** | **-80%** | **-99.9%** |

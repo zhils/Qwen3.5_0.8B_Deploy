@@ -84,6 +84,8 @@ class CudaFullAttention {
     mutable float* d_batch_attn_out_buf_;
     mutable int max_batch_size_;
 
+    cublasHandle_t cublas_handle_;
+
     void ensure_batch_buffers(int batch_size) const;
 };
 
