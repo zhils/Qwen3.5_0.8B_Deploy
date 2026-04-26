@@ -14,20 +14,29 @@
 
 ### 与 llama.cpp 对比 (同硬件 RTX 5060 Ti)
 
+#### 单请求对比 (batch=1)
+
 | 指标 | 本项目 (v3.0) | llama.cpp (BF16 GGUF) | 优势 |
 |------|--------------|----------------------|------|
-| **Prefill 吞吐** | **525.6 tok/s** | **193.16 t/s** | **2.7x** |
-| **Decode 吞吐** | **16,248 tok/s** | **191.79 t/s** | **84.7x** |
-| **Prefill TTFT (1024 tok)** | **1,948 ms** | **5,301 ms** | **2.7x** |
-| **Decode TPOT** | **0.062 ms** | **5.21 ms** | **84.0x** |
-| **端到端耗时 (1024+512)** | **1,980 ms** | **7,971 ms** | **4.0x** |
-| **显存占用** | 10,707 MB | 2,298 MB | - |
+| **Prefill 吞吐** | **40.4 tok/s** | **193.16 t/s** | **0.21x** |
+| **Decode 吞吐** | **16,346 tok/s** | **191.79 t/s** | **85.2x** |
+| **Prefill TTFT (1024 tok)** | **25,336 ms** | **5,301 ms** | **0.21x** |
+| **Decode TPOT** | **0.061 ms** | **5.21 ms** | **85.4x** |
+| **端到端耗时 (1024+512)** | **25,367 ms** | **7,971 ms** | **0.31x** |
+| **显存占用** | 10,355 MB | 2,298 MB | - |
+
+#### Batch 对比 (batch=128)
+
+| 指标 | 本项目 (v3.0) | llama.cpp (BF16 GGUF) | 优势 |
+|------|--------------|----------------------|------|
+| **Prefill 吞吐** | **525.6 tok/s** | 未测试 | - |
+| **Prefill TTFT (1024 tok)** | **1,948 ms** | 未测试 | - |
 
 > **测试条件说明**：
 > - llama.cpp：使用 `llama-bench` 实测，`qwen3.5-0.8b-f16.gguf` (BF16)，batch=1，`-ngl 99 -fa 1`，重复 20 次取 P50
-> - 本项目：FP32 权重，batch_size=128（仅影响 prefill），decode 为单 token 生成
-> - **Decode 差距说明**：84.7x 的差距主要来自 (1) 本项目启用 CUDA Graph 消除 kernel launch 开销；(2) 全融合 kernel（SiLU+Mul、RMSNorm+Residual 等）减少 HBM 访存；(3) 预分配 buffer 无动态内存分配。llama.cpp 作为通用框架，在 0.8B 小模型上 kernel launch 和框架开销占比较高。
-> - 端到端耗时 = Prefill TTFT + Decode 耗时 (512 × 0.062ms ≈ 32ms)
+> - 本项目：FP32 权重，batch_size=1（单请求）或 128（batch prefill）
+> - **Prefill 差距说明**：单请求时本项目 prefill 仅 40.4 tok/s，远低于 llama.cpp 的 193.16 t/s。这是因为 llama.cpp 在单请求场景下优化更成熟（如 prompt caching、graph capture 等）。本项目的优势在 **batch 场景**，通过 Batch Linear Attention + cuBLAS GEMM 将 prefill 提升至 525.6 tok/s。
+> - **Decode 差距说明**：85.2x 的差距主要来自 (1) 本项目启用 CUDA Graph 消除 kernel launch 开销；(2) 全融合 kernel（SiLU+Mul、RMSNorm+Residual 等）减少 HBM 访存；(3) 预分配 buffer 无动态内存分配。llama.cpp 作为通用框架，在 0.8B 小模型上 kernel launch 和框架开销占比较高。
 
 ### 性能演进
 
