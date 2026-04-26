@@ -220,8 +220,10 @@ static void run_v2_benchmark(const TestConfig& cfg) {
         CHECK_CUDA(cudaEventRecord(ev_start));
 
         const int BATCH_SIZE = 64;
-        std::vector<float> h_batch_input(BATCH_SIZE * cfg.hidden_size);
-        std::vector<int> h_positions(BATCH_SIZE);
+        float* h_batch_input = nullptr;
+        int* h_positions = nullptr;
+        CHECK_CUDA(cudaMallocHost(&h_batch_input, BATCH_SIZE * cfg.hidden_size * sizeof(float)));
+        CHECK_CUDA(cudaMallocHost(&h_positions, BATCH_SIZE * sizeof(int)));
         float* d_batch_input;
         float* d_batch_output;
         CHECK_CUDA(cudaMalloc(&d_batch_input, BATCH_SIZE * cfg.hidden_size * sizeof(float)));
@@ -234,17 +236,17 @@ static void run_v2_benchmark(const TestConfig& cfg) {
             for (int b = 0; b < current_batch; ++b) {
                 int token_id = 151644 + ((prefill_pos + b) % 100);
                 emb.forward(token_id, d_emb);
-                CHECK_CUDA(cudaMemcpy(h_batch_input.data() + b * cfg.hidden_size,
+                CHECK_CUDA(cudaMemcpy(h_batch_input + b * cfg.hidden_size,
                                       d_emb, cfg.hidden_size * sizeof(float),
                                       cudaMemcpyDeviceToHost));
                 h_positions[b] = prefill_pos + b;
             }
 
-            CHECK_CUDA(cudaMemcpy(d_batch_input, h_batch_input.data(),
+            CHECK_CUDA(cudaMemcpy(d_batch_input, h_batch_input,
                                   current_batch * cfg.hidden_size * sizeof(float),
                                   cudaMemcpyHostToDevice));
 
-            engine.forward_batch_prefill(d_batch_input, d_batch_output, h_positions.data(),
+            engine.forward_batch_prefill(d_batch_input, d_batch_output, h_positions,
                                          current_batch);
 
             if (prefill_pos + current_batch >= cfg.prefill_tokens || current_batch < BATCH_SIZE) {
@@ -267,6 +269,8 @@ static void run_v2_benchmark(const TestConfig& cfg) {
 
         cudaFree(d_batch_input);
         cudaFree(d_batch_output);
+        cudaFreeHost(h_batch_input);
+        cudaFreeHost(h_positions);
 
         int position = cfg.prefill_tokens;
         for (int step = 0; step < cfg.decode_tokens; ++step) {

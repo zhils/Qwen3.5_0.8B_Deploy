@@ -162,16 +162,16 @@ Clear/reclaim：
 - **Tensor Core (TF32)**: cuBLAS math mode for GEMM acceleration
 - **Kernel Fusion**: Gate+SiLU+Mul, RMSNorm+Residual
 - **Batch Prefill**: 真正的批量 prefill 并行处理
-- **CUDA Graph**: Decode 阶段 kernel launch 开销优化
+- **Pinned Memory**: 使用 cudaMallocHost 优化 H2D 传输
 
 ### 6.3 实测数据 (5 rounds average)
 
 | 指标 | 数值 |
 |------|------|
-| **Prefill TTFT** | 11,942 ms |
-| **Prefill 吞吐** | 85.7 tok/s |
+| **Prefill TTFT** | 11,856 ms |
+| **Prefill 吞吐** | 86.4 tok/s |
 | **Decode TPOT** | 0.063 ms/tok |
-| **Decode 吞吐** | 15,991 tok/s |
+| **Decode 吞吐** | 15,774 tok/s |
 | **GPU VRAM** | 8,833 MB |
 
 ### 6.4 性能对比总结
@@ -179,19 +179,19 @@ Clear/reclaim：
 | 版本 | Prefill 吞吐 (tok/s) | Decode 吞吐 (tok/s) | TTFT (ms) | TPOT (ms) |
 |------|---------------------|---------------------|-----------|-----------|
 | v1.0 | 17.5 | 12.5 | 58,400 | 79.96 |
-| **v2.0** | **85.7** | **15,991** | **11,942** | **0.063** |
-| **提升** | **+389%** | **+127,828%** | **-80%** | **-99.9%** |
+| **v2.0** | **86.4** | **15,774** | **11,856** | **0.063** |
+| **提升** | **+394%** | **+126,190%** | **-80%** | **-99.9%** |
 
 ### 6.5 优化效果分析
 
 1. **Prefill 阶段**:
    - v1.0: 逐 token 顺序处理，24,576 次 kernel launch
    - v2.0: Batch prefill + Flash Attention v2，大幅减少 launch 开销
-   - 效果: TTFT 从 58.4s 降至 11.9s，吞吐提升 389%
+   - 效果: TTFT 从 58.4s 降至 11.9s，吞吐提升 394%
 
 2. **Decode 阶段**:
    - v1.0: 动态内存分配，无优化
-   - v2.0: Flash Attention v2 + Tensor Core + CUDA Graph
+   - v2.0: Flash Attention v2 + Tensor Core + Kernel Fusion
    - 效果: TPOT 从 79.96ms 降至 0.063ms，吞吐提升 127,828%
 
 ## 7) 原始数据文件

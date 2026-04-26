@@ -107,10 +107,6 @@ class CudaEngine {
         return ready_;
     }
 
-    void capture_decode_graph(const float* d_input, float* d_output, int position);
-    bool replay_decode_graph();
-    void release_graph();
-
   private:
     int num_layers_;
     int hidden_size_;
@@ -145,11 +141,6 @@ class CudaEngine {
     bool ready_;
 
     std::unique_ptr<StreamManager> stream_manager_;
-
-    cudaGraph_t decode_graph_ = nullptr;
-    cudaGraphExec_t decode_graph_exec_ = nullptr;
-    bool graph_captured_ = false;
-    int graph_capture_position_ = -1;
 
     void allocate_buffers();
     void free_buffers();
