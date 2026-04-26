@@ -16,9 +16,9 @@
 
 | 版本 | Prefill 吞吐 | Decode 吞吐 | TTFT | 主要优化 |
 |------|-------------|-------------|------|---------|
-| v1.0 (Baseline) | 17.5 tok/s | 12.5 tok/s | 58,400 ms | CPU 实现 |
-| v2.0 (FlashAttention) | 86.4 tok/s | 15,774 tok/s | 11,856 ms | FlashAttention v2 + Tensor Core |
-| **v3.0 (Batch GEMM)** | **525.6 tok/s** | **16,248 tok/s** | **1,948 ms** | **Batch Linear Attention + cuBLAS GEMM** |
+| v1.0 (CUDA Baseline) | 17.5 tok/s | 12.5 tok/s | 58,400 ms | CUDA 基础实现，单 token 串行 |
+| v2.0 (FlashAttention) | 86.4 tok/s | 15,774 tok/s | 11,856 ms | FlashAttention v2 + Tensor Core + Batch Prefill |
+| **v3.0 (Batch GEMM)** | **525.6 tok/s** | **16,248 tok/s** | **1,948 ms** | **Batch Linear Attention + cuBLAS GEMM + Kernel Fusion** |
 
 **v3.0 相比 v1.0**: Prefill 提升 **+2,904%**，TTFT 降低 **-97%**
 
