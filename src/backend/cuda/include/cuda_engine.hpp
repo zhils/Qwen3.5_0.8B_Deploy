@@ -56,7 +56,7 @@ class CudaLayer {
     void forward_batch_prefill(const float* d_input, float* d_output, float* d_normed_input_buf,
                                float* d_attn_out_buf, float* d_post_normed_buf, float* d_mlp_out_buf,
                                CudaKVCache& kv_cache, CudaLinearAttnState& lin_state,
-                               const int* positions, int batch_size) const;
+                               const int* positions, int batch_size, int max_seq = 0) const;
 
     int layer_idx() const {
         return layer_idx_;

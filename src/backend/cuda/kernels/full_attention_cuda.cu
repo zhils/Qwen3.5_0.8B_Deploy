@@ -508,7 +508,8 @@ void CudaFullAttention::ensure_batch_buffers(int batch_size) const {
 
 void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
                                               CudaKVCache& kv_cache, int layer_idx,
-                                              const int* positions, int batch_size) const {
+                                              const int* positions, int batch_size,
+                                              int max_seq) const {
     ensure_batch_buffers(batch_size);
 
     int rotary_dim = static_cast<int>(kv_head_dim_ * 0.25f);
@@ -529,23 +530,29 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
         rotary_dim, 10000000.0f, positions, 1e-6f, batch_size, layer_idx, kv_cache.max_seq_len);
     FA_CUDA_CHECK();
 
-    std::vector<int> h_positions(batch_size);
-    cudaMemcpy(h_positions.data(), positions, batch_size * sizeof(int), cudaMemcpyDeviceToHost);
-    for (int b = 0; b < batch_size; ++b) {
-        kv_cache.layer_lengths[layer_idx] = std::max(kv_cache.layer_lengths[layer_idx], 
-                                                      h_positions[b] + 1);
-    }
-
-    int max_seq = 0;
-    for (int b = 0; b < batch_size; ++b) {
-        max_seq = std::max(max_seq, h_positions[b] + 1);
+    // Use precomputed max_seq if provided (for CUDA Graph compatibility)
+    // Otherwise compute from positions (fallback for non-graph path)
+    int actual_max_seq = max_seq;
+    if (actual_max_seq == 0) {
+        std::vector<int> h_positions(batch_size);
+        cudaMemcpy(h_positions.data(), positions, batch_size * sizeof(int), cudaMemcpyDeviceToHost);
+        for (int b = 0; b < batch_size; ++b) {
+            kv_cache.layer_lengths[layer_idx] = std::max(kv_cache.layer_lengths[layer_idx], 
+                                                          h_positions[b] + 1);
+        }
+        for (int b = 0; b < batch_size; ++b) {
+            actual_max_seq = std::max(actual_max_seq, h_positions[b] + 1);
+        }
+    } else {
+        // Update layer_lengths with precomputed max_seq
+        kv_cache.layer_lengths[layer_idx] = std::max(kv_cache.layer_lengths[layer_idx], actual_max_seq);
     }
 
     float attn_scale = 1.0f / sqrtf(static_cast<float>(q_head_dim_));
     launch_flash_attn_v2_prefill(
         d_batch_q_buf_, kv_cache.d_k_cache, kv_cache.d_v_cache,
         d_batch_attn_out_buf_, num_heads_, num_kv_heads_, kv_head_dim_,
-        max_seq, batch_size, layer_idx, kv_cache.max_seq_len, attn_scale, 0);
+        actual_max_seq, batch_size, layer_idx, kv_cache.max_seq_len, attn_scale, 0);
     FA_CUDA_CHECK();
 
     dim3 gate_grid(num_heads_, batch_size);

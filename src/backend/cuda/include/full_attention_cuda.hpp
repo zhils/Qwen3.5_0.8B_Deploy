@@ -43,9 +43,11 @@ class CudaFullAttention {
      * input:  [batch_size, hidden_size] contiguous
      * output: [batch_size, hidden_size] contiguous
      * positions: [batch_size] positions for RoPE
+     * max_seq: precomputed max sequence length (avoids D2H memcpy for CUDA Graph)
      */
     void forward_batch_prefill(const float* input, float* output, CudaKVCache& kv_cache,
-                               int layer_idx, const int* positions, int batch_size) const;
+                               int layer_idx, const int* positions, int batch_size,
+                               int max_seq = 0) const;
 
     int hidden_size() const {
         return hidden_size_;

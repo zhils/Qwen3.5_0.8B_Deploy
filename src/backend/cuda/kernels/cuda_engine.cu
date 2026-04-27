@@ -128,14 +128,14 @@ void CudaLayer::forward_batch_prefill(const float* d_input, float* d_output,
                                       float* d_normed_input_buf, float* d_attn_out_buf,
                                       float* d_post_normed_buf, float* d_mlp_out_buf,
                                       CudaKVCache& kv_cache, CudaLinearAttnState& lin_state,
-                                      const int* positions, int batch_size) const {
+                                      const int* positions, int batch_size, int max_seq) const {
     input_norm_->forward(d_input, d_normed_input_buf, batch_size);
 
     if (is_linear_) {
         linear_attn_->forward_batch(d_normed_input_buf, d_attn_out_buf, lin_state, batch_size);
     } else {
         full_attn_->forward_batch_prefill(d_normed_input_buf, d_attn_out_buf, kv_cache, layer_idx_,
-                                          positions, batch_size);
+                                          positions, batch_size, max_seq);
     }
 
     post_norm_->forward_with_residual(d_input, d_attn_out_buf, d_output, d_post_normed_buf,
@@ -157,8 +157,10 @@ CudaEngine::CudaEngine(int num_layers, int hidden_size, int intermediate_size, i
     default_config.hidden_size = hidden_size;
     default_config.intermediate_size = intermediate_size;
 
+    // v2.1: Adjust Linear/Full Attention ratio from 75/25 to 50/50
+    // Pattern: Linear, Linear, Full, Full (repeating)
     for (int i = 0; i < num_layers_; ++i) {
-        default_config.is_linear = (i % 4 != 3);
+        default_config.is_linear = (i % 4 < 2);
         layers_.push_back(std::make_unique<CudaLayer>(i, default_config));
     }
 
@@ -239,7 +241,8 @@ void CudaEngine::set_layer_weights(int layer_idx, const std::vector<float>& weig
     int lnh = 16, lnkh = 2, kd = 128, vd = 128, ck = 4;
     int fnh = 8, qhd = 256, khd = 256;
 
-    bool is_linear = (layer_idx % 4 != 3);
+    // v2.1: 50/50 ratio - Linear, Linear, Full, Full
+    bool is_linear = (layer_idx % 4 < 2);
 
     int offset = 0;
     auto slice = [&](int n) -> std::vector<float> {
@@ -327,6 +330,12 @@ void CudaEngine::forward_batch_prefill(const float* d_input, float* d_output, co
     CHECK_CUDA(cudaMemcpy(d_positions_buf_, positions, batch_size * sizeof(int),
                           cudaMemcpyHostToDevice));
 
+    // Precompute max_seq to avoid D2H memcpy in attention kernels
+    int max_seq = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        max_seq = std::max(max_seq, positions[b] + 1);
+    }
+
     float* ping = d_batch_input_buf_;
     float* pong = d_batch_output_buf_;
 
@@ -336,7 +345,7 @@ void CudaEngine::forward_batch_prefill(const float* d_input, float* d_output, co
 
         layers_[i]->forward_batch_prefill(layer_in, layer_out, d_normed_input_, d_attn_out_,
                                           d_post_normed_, d_mlp_out_, kv_cache_, linear_states_[i],
-                                          d_positions_buf_, batch_size);
+                                          d_positions_buf_, batch_size, max_seq);
     }
 
     float* final_in = (num_layers_ % 2 == 0) ? ping : pong;
@@ -350,9 +359,87 @@ void CudaEngine::forward_batch_prefill_graph(const float* d_input, float* d_outp
         return;
     }
 
-    // For now, CUDA Graph is disabled due to D2H memcpy in attention kernels
-    // Fall back to regular batch prefill
-    forward_batch_prefill(d_input, d_output, positions, batch_size);
+    ensure_batch_buffers(batch_size);
+
+    // Precompute max_seq on CPU
+    int max_seq = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        max_seq = std::max(max_seq, positions[b] + 1);
+    }
+
+    // Copy input data to graph buffers (outside graph)
+    CHECK_CUDA(cudaMemcpy(d_batch_input_buf_, d_input,
+                          static_cast<size_t>(batch_size) * hidden_size_ * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(d_positions_buf_, positions, batch_size * sizeof(int),
+                          cudaMemcpyHostToDevice));
+
+    // Capture or replay graph
+    if (!prefill_graph_captured_ || prefill_graph_batch_size_ != batch_size) {
+        // Destroy old graph if exists
+        if (prefill_graph_exec_) {
+            cudaGraphExecDestroy(prefill_graph_exec_);
+            prefill_graph_exec_ = nullptr;
+        }
+        if (prefill_graph_) {
+            cudaGraphDestroy(prefill_graph_);
+            prefill_graph_ = nullptr;
+        }
+
+        // Warm-up: run once to allocate all internal buffers
+        {
+            float* ping = d_batch_input_buf_;
+            float* pong = d_batch_output_buf_;
+            for (int i = 0; i < num_layers_; ++i) {
+                float* layer_out = (i % 2 == 0) ? pong : ping;
+                float* layer_in = (i % 2 == 0) ? ping : pong;
+                layers_[i]->forward_batch_prefill(layer_in, layer_out, d_normed_input_, d_attn_out_,
+                                                  d_post_normed_, d_mlp_out_, kv_cache_,
+                                                  linear_states_[i], d_positions_buf_, batch_size,
+                                                  max_seq);
+            }
+            float* final_in = (num_layers_ % 2 == 0) ? ping : pong;
+            final_norm_->forward(final_in, d_output, batch_size);
+            cudaDeviceSynchronize();
+        }
+
+        // Reset cache after warm-up
+        reset_cache();
+
+        // Copy input data again after reset
+        CHECK_CUDA(cudaMemcpy(d_batch_input_buf_, d_input,
+                              static_cast<size_t>(batch_size) * hidden_size_ * sizeof(float),
+                              cudaMemcpyDeviceToDevice));
+        CHECK_CUDA(cudaMemcpy(d_positions_buf_, positions, batch_size * sizeof(int),
+                              cudaMemcpyHostToDevice));
+
+        // Capture the graph
+        cudaStream_t capture_stream = 0;
+        cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
+
+        float* ping = d_batch_input_buf_;
+        float* pong = d_batch_output_buf_;
+        for (int i = 0; i < num_layers_; ++i) {
+            float* layer_out = (i % 2 == 0) ? pong : ping;
+            float* layer_in = (i % 2 == 0) ? ping : pong;
+            layers_[i]->forward_batch_prefill(layer_in, layer_out, d_normed_input_, d_attn_out_,
+                                              d_post_normed_, d_mlp_out_, kv_cache_,
+                                              linear_states_[i], d_positions_buf_, batch_size,
+                                              max_seq);
+        }
+        float* final_in = (num_layers_ % 2 == 0) ? ping : pong;
+        final_norm_->forward(final_in, d_output, batch_size);
+
+        cudaStreamEndCapture(capture_stream, &prefill_graph_);
+        cudaGraphInstantiate(&prefill_graph_exec_, prefill_graph_, nullptr, nullptr, 0);
+
+        prefill_graph_captured_ = true;
+        prefill_graph_batch_size_ = batch_size;
+    }
+
+    // Replay the graph
+    cudaGraphLaunch(prefill_graph_exec_, 0);
+    cudaDeviceSynchronize();
 }
 
 void CudaEngine::ensure_batch_buffers(int batch_size) {
