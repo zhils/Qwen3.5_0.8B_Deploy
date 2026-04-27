@@ -77,8 +77,6 @@ class CudaLinearAttention {
     mutable float* d_attn_out_buf_;
     mutable float* d_z_buf_;
 
-    cublasHandle_t cublas_handle_;
-
     mutable float* d_batch_mixed_qkv_buf_;
     mutable float* d_batch_conv_out_buf_;
     mutable float* d_batch_a_buf_;

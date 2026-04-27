@@ -1,6 +1,7 @@
 #include "linear_attention_cuda.hpp"
 #include "cuda_utils.cuh"
 #include "cuda_error_handling.cuh"
+#include "cublas_handle_pool.hpp"
 #include <cublas_v2.h>
 #include <cmath>
 #include <cstdio>
@@ -353,7 +354,7 @@ void CudaLinearAttnState::clear() {
 CudaLinearAttention::CudaLinearAttention(int hidden_size, int num_heads, int key_dim, int value_dim,
                                          int conv_kernel)
     : hidden_size_(hidden_size), num_heads_(num_heads), key_dim_(key_dim), value_dim_(value_dim),
-      conv_kernel_(conv_kernel), cublas_handle_(nullptr), d_batch_mixed_qkv_buf_(nullptr),
+      conv_kernel_(conv_kernel), d_batch_mixed_qkv_buf_(nullptr),
       d_batch_conv_out_buf_(nullptr), d_batch_a_buf_(nullptr), d_batch_b_raw_buf_(nullptr),
       d_batch_z_buf_(nullptr), d_batch_attn_out_buf_(nullptr), max_batch_size_(0) {
     int k_dim = num_heads_ * key_dim_;
@@ -384,9 +385,6 @@ CudaLinearAttention::CudaLinearAttention(int hidden_size, int num_heads, int key
     cudaMalloc(&d_b_raw_buf_, static_cast<size_t>(num_heads_) * sizeof(float));
     cudaMalloc(&d_attn_out_buf_, static_cast<size_t>(z_dim) * sizeof(float));
     cudaMalloc(&d_z_buf_, static_cast<size_t>(z_dim) * sizeof(float));
-
-    LA_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
-    cublasSetMathMode(cublas_handle_, CUBLAS_TF32_TENSOR_OP_MATH);
 }
 
 CudaLinearAttention::~CudaLinearAttention() {
@@ -428,8 +426,6 @@ CudaLinearAttention::~CudaLinearAttention() {
     if (d_z_buf_)
         cudaFree(d_z_buf_);
 
-    if (cublas_handle_)
-        cublasDestroy(cublas_handle_);
     if (d_batch_mixed_qkv_buf_)
         cudaFree(d_batch_mixed_qkv_buf_);
     if (d_batch_conv_out_buf_)
@@ -603,6 +599,8 @@ void CudaLinearAttention::forward(const float* input, float* output,
 
 void CudaLinearAttention::forward_batch(const float* input, float* output,
                                         CudaLinearAttnState& state, int batch_size) const {
+    cublasHandle_t handle = CublasHandlePool::instance().get();
+
     if (batch_size == 1) {
         forward(input, output, state);
         return;
@@ -637,28 +635,28 @@ void CudaLinearAttention::forward_batch(const float* input, float* output,
 
     // Step 1: Batch QKV projection using cuBLAS GEMM
     // mixed_qkv = input × qkv_weight^T  [batch, hidden] × [hidden, conv_dim]
-    LA_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                 conv_dim, batch_size, hidden_size_,
                                 &alpha, d_in_proj_qkv_weight_, hidden_size_,
                                 input, hidden_size_,
                                 &beta, d_mixed_qkv, conv_dim));
 
     // Step 2: Batch A projection
-    LA_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                 num_heads_, batch_size, hidden_size_,
                                 &alpha, d_in_proj_a_weight_, hidden_size_,
                                 input, hidden_size_,
                                 &beta, d_a, num_heads_));
 
     // Step 3: Batch B projection
-    LA_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                 num_heads_, batch_size, hidden_size_,
                                 &alpha, d_in_proj_b_weight_, hidden_size_,
                                 input, hidden_size_,
                                 &beta, d_b_raw, num_heads_));
 
     // Step 4: Batch Z projection
-    LA_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                 z_dim, batch_size, hidden_size_,
                                 &alpha, d_in_proj_z_weight_, hidden_size_,
                                 input, hidden_size_,
@@ -706,7 +704,7 @@ void CudaLinearAttention::forward_batch(const float* input, float* output,
 
     // Step 9: Batch Output projection using cuBLAS GEMM
     // output = attn_out × out_weight^T  [batch, z_dim] × [z_dim, hidden]
-    LA_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                 hidden_size_, batch_size, z_dim,
                                 &alpha, d_out_proj_weight_, z_dim,
                                 d_attn_out, z_dim,

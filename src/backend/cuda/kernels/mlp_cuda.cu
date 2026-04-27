@@ -1,6 +1,7 @@
 #include "mlp_cuda.hpp"
 #include "cuda_error_handling.cuh"
 #include "fused_kernels.cuh"
+#include "cublas_handle_pool.hpp"
 #include <cmath>
 #include <stdexcept>
 #include <cublas_v2.h>
@@ -34,17 +35,13 @@ __global__ void mlp_down_kernel(const float* __restrict__ hidden, float* __restr
 CudaMLP::CudaMLP(int hidden_size, int intermediate_size)
     : hidden_size_(hidden_size), intermediate_size_(intermediate_size),
       d_gate_proj_weight_(nullptr), d_up_proj_weight_(nullptr), d_down_proj_weight_(nullptr),
-      cublas_handle_(nullptr), d_hidden_buf_(nullptr), max_hidden_batch_(0) {
+      d_hidden_buf_(nullptr), max_hidden_batch_(0) {
     size_t gate_size = static_cast<size_t>(intermediate_size_) * hidden_size_;
     size_t down_size = static_cast<size_t>(hidden_size_) * intermediate_size_;
 
     cudaMalloc(&d_gate_proj_weight_, gate_size * sizeof(float));
     cudaMalloc(&d_up_proj_weight_, gate_size * sizeof(float));
     cudaMalloc(&d_down_proj_weight_, down_size * sizeof(float));
-
-    MLP_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
-
-    cublasSetMathMode(cublas_handle_, CUBLAS_TF32_TENSOR_OP_MATH);
 }
 
 CudaMLP::~CudaMLP() {
@@ -54,8 +51,6 @@ CudaMLP::~CudaMLP() {
         cudaFree(d_up_proj_weight_);
     if (d_down_proj_weight_)
         cudaFree(d_down_proj_weight_);
-    if (cublas_handle_)
-        cublasDestroy(cublas_handle_);
     if (d_hidden_buf_)
         cudaFree(d_hidden_buf_);
 }
@@ -67,8 +62,9 @@ void CudaMLP::ensure_hidden_buffer(int batch_size) const {
     if (d_hidden_buf_) {
         cudaFree(d_hidden_buf_);
     }
-    // Need space for gate + up + hidden (all [batch_size, intermediate_size])
-    size_t bytes = static_cast<size_t>(batch_size) * intermediate_size_ * sizeof(float) * 3;
+    // Need space for gate + up (all [batch_size, intermediate_size])
+    // down projection reuses gate buffer
+    size_t bytes = static_cast<size_t>(batch_size) * intermediate_size_ * sizeof(float) * 2;
     cudaMalloc(&d_hidden_buf_, bytes);
     max_hidden_batch_ = batch_size;
 }
@@ -88,7 +84,8 @@ void CudaMLP::set_weights(const std::vector<float>& gate_proj_weight,
 }
 
 void CudaMLP::forward(const float* input, float* output, int batch_size) const {
-    // Always use cuBLAS GEMM path for better performance and Tensor Core utilization
+    cublasHandle_t handle = CublasHandlePool::instance().get();
+
     if (batch_size == 1) {
         float* d_gate_buf;
         float* d_up_buf;
@@ -97,26 +94,22 @@ void CudaMLP::forward(const float* input, float* output, int batch_size) const {
 
         const float alpha = 1.0f, beta = 0.0f;
 
-        // gate projection: [1, hidden] × [hidden, inter] → [1, inter]
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      intermediate_size_, 1, hidden_size_,
                                      &alpha, d_gate_proj_weight_, hidden_size_,
                                      input, hidden_size_,
                                      &beta, d_gate_buf, intermediate_size_));
 
-        // up projection: [1, hidden] × [hidden, inter] → [1, inter]
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      intermediate_size_, 1, hidden_size_,
                                      &alpha, d_up_proj_weight_, hidden_size_,
                                      input, hidden_size_,
                                      &beta, d_up_buf, intermediate_size_));
 
-        // SiLU(gate) * up
         launch_silu_mul_batch(d_gate_buf, d_up_buf, d_gate_buf, intermediate_size_);
         CUDA_CHECK_LAST_KERNEL();
 
-        // down projection: [1, inter] × [inter, hidden] → [1, hidden]
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      hidden_size_, 1, intermediate_size_,
                                      &alpha, d_down_proj_weight_, intermediate_size_,
                                      d_gate_buf, intermediate_size_,
@@ -127,42 +120,38 @@ void CudaMLP::forward(const float* input, float* output, int batch_size) const {
     } else {
         ensure_hidden_buffer(batch_size);
 
-        // Batch MLP using cuBLAS GEMM for all projections
         float* d_gate_buf = d_hidden_buf_;
         float* d_up_buf = d_hidden_buf_ + static_cast<size_t>(batch_size) * intermediate_size_;
 
         const float alpha = 1.0f, beta = 0.0f;
 
-        // gate projection
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      intermediate_size_, batch_size, hidden_size_,
                                      &alpha, d_gate_proj_weight_, hidden_size_,
                                      input, hidden_size_,
                                      &beta, d_gate_buf, intermediate_size_));
 
-        // up projection
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      intermediate_size_, batch_size, hidden_size_,
                                      &alpha, d_up_proj_weight_, hidden_size_,
                                      input, hidden_size_,
                                      &beta, d_up_buf, intermediate_size_));
 
-        // Element-wise SiLU(gate) * up
         int total_elements = batch_size * intermediate_size_;
-        launch_silu_mul_batch(d_gate_buf, d_up_buf, d_hidden_buf_, total_elements);
+        launch_silu_mul_batch(d_gate_buf, d_up_buf, d_gate_buf, total_elements);
 
-        // down projection with residual add
-        const float alpha_down = 1.0f, beta_down = 1.0f;
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        const float alpha_down = 1.0f, beta_down = 0.0f;
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      hidden_size_, batch_size, intermediate_size_,
                                      &alpha_down, d_down_proj_weight_, intermediate_size_,
-                                     d_hidden_buf_, intermediate_size_,
+                                     d_gate_buf, intermediate_size_,
                                      &beta_down, output, hidden_size_));
     }
 }
 
 void CudaMLP::forward_add_residual(const float* input, float* residual, int batch_size) const {
-    // Unified path: always use cuBLAS GEMM for all batch sizes
+    cublasHandle_t handle = CublasHandlePool::instance().get();
+
     if (batch_size == 1) {
         float* d_gate_buf;
         float* d_up_buf;
@@ -171,27 +160,23 @@ void CudaMLP::forward_add_residual(const float* input, float* residual, int batc
 
         const float alpha = 1.0f, beta = 0.0f;
 
-        // gate projection: [1, hidden] × [hidden, inter] → [1, inter]
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      intermediate_size_, 1, hidden_size_,
                                      &alpha, d_gate_proj_weight_, hidden_size_,
                                      input, hidden_size_,
                                      &beta, d_gate_buf, intermediate_size_));
 
-        // up projection: [1, hidden] × [hidden, inter] → [1, inter]
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      intermediate_size_, 1, hidden_size_,
                                      &alpha, d_up_proj_weight_, hidden_size_,
                                      input, hidden_size_,
                                      &beta, d_up_buf, intermediate_size_));
 
-        // SiLU(gate) * up
         launch_silu_mul_batch(d_gate_buf, d_up_buf, d_gate_buf, intermediate_size_);
         CUDA_CHECK_LAST_KERNEL();
 
-        // down projection with residual: [1, inter] × [inter, hidden] → [1, hidden]
         const float alpha_down = 1.0f, beta_down = 1.0f;
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      hidden_size_, 1, intermediate_size_,
                                      &alpha_down, d_down_proj_weight_, intermediate_size_,
                                      d_gate_buf, intermediate_size_,
@@ -202,36 +187,31 @@ void CudaMLP::forward_add_residual(const float* input, float* residual, int batc
     } else {
         ensure_hidden_buffer(batch_size);
 
-        // Batch MLP using cuBLAS GEMM for all projections
         float* d_gate_buf = d_hidden_buf_;
         float* d_up_buf = d_hidden_buf_ + static_cast<size_t>(batch_size) * intermediate_size_;
 
         const float alpha = 1.0f, beta = 0.0f;
 
-        // gate projection
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      intermediate_size_, batch_size, hidden_size_,
                                      &alpha, d_gate_proj_weight_, hidden_size_,
                                      input, hidden_size_,
                                      &beta, d_gate_buf, intermediate_size_));
 
-        // up projection
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      intermediate_size_, batch_size, hidden_size_,
                                      &alpha, d_up_proj_weight_, hidden_size_,
                                      input, hidden_size_,
                                      &beta, d_up_buf, intermediate_size_));
 
-        // Element-wise SiLU(gate) * up
         int total_elements = batch_size * intermediate_size_;
-        launch_silu_mul_batch(d_gate_buf, d_up_buf, d_hidden_buf_, total_elements);
+        launch_silu_mul_batch(d_gate_buf, d_up_buf, d_gate_buf, total_elements);
 
-        // down projection with residual add
         const float alpha_down = 1.0f, beta_down = 1.0f;
-        MLP_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+        MLP_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                      hidden_size_, batch_size, intermediate_size_,
                                      &alpha_down, d_down_proj_weight_, intermediate_size_,
-                                     d_hidden_buf_, intermediate_size_,
+                                     d_gate_buf, intermediate_size_,
                                      &beta_down, residual, hidden_size_));
     }
 }

@@ -1,6 +1,7 @@
 #include "full_attention_cuda.hpp"
 #include "flash_attention.cuh"
 #include "fused_kernels.cuh"
+#include "cublas_handle_pool.hpp"
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
@@ -160,7 +161,7 @@ CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_
       d_gate_buf_(nullptr), d_k_buf_(nullptr), d_v_buf_(nullptr), d_attn_out_buf_(nullptr),
       d_attn_scores_buf_(nullptr), max_seq_len_(8192), d_batch_q_buf_(nullptr),
       d_batch_gate_buf_(nullptr), d_batch_k_buf_(nullptr), d_batch_v_buf_(nullptr),
-      d_batch_attn_out_buf_(nullptr), max_batch_size_(0), cublas_handle_(nullptr) {
+      d_batch_attn_out_buf_(nullptr), max_batch_size_(0) {
     int total_q = num_heads_ * q_head_dim_;
     int total_kv = num_kv_heads_ * kv_head_dim_;
     int total_out = num_heads_ * kv_head_dim_;
@@ -178,9 +179,6 @@ CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_
     cudaMalloc(&d_v_buf_, static_cast<size_t>(total_kv) * sizeof(float));
     cudaMalloc(&d_attn_out_buf_, static_cast<size_t>(total_out) * sizeof(float));
     cudaMalloc(&d_attn_scores_buf_, static_cast<size_t>(num_heads_) * max_seq_len_ * sizeof(float));
-
-    FA_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
-    FA_CUBLAS_CHECK(cublasSetMathMode(cublas_handle_, CUBLAS_TF32_TENSOR_OP_MATH));
 }
 
 CudaFullAttention::~CudaFullAttention() {
@@ -208,8 +206,6 @@ CudaFullAttention::~CudaFullAttention() {
         cudaFree(d_attn_out_buf_);
     if (d_attn_scores_buf_)
         cudaFree(d_attn_scores_buf_);
-    if (cublas_handle_)
-        cublasDestroy(cublas_handle_);
 }
 
 void CudaFullAttention::set_weights(const std::vector<float>& q_proj_weight,
@@ -563,8 +559,9 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
     // Use cuBLAS GEMM for output projection: output = attn_out × o_weight^T
     // attn_out: [batch_size, total_out], o_weight: [hidden_size, total_out]
     // output = attn_out × o_weight^T  =>  [batch_size, total_out] × [total_out, hidden_size]
+    cublasHandle_t handle = CublasHandlePool::instance().get();
     const float alpha = 1.0f, beta = 0.0f;
-    FA_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    FA_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                 hidden_size_, batch_size, total_out,
                                 &alpha, d_o_proj_weight_, total_out,
                                 d_batch_attn_out_buf_, total_out,

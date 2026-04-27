@@ -187,8 +187,9 @@ static void run_v2_benchmark(const TestConfig& cfg) {
                       cfg.max_seq_len);
 
     std::cout << "\n[Loading random weights...]" << std::endl;
+    // v2.1: 50/50 ratio - Linear, Linear, Full, Full
     for (int i = 0; i < cfg.num_layers; ++i) {
-        bool is_full = ((i % 4) == 3);
+        bool is_full = ((i % 4) >= 2);
         auto flat = build_flat_weights(is_full, cfg);
         engine.set_layer_weights(i, flat);
     }

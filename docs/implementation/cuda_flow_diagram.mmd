@@ -1,0 +1,58 @@
+graph TD
+    subgraph Engine["CudaEngine::forward_batch_prefill"]
+        Start([开始]) --> CopyData["1. 数据拷贝<br/>H2D: positions[128]<br/>D2D: input[128×1024]"]
+        CopyData --> LayerLoop{"2. Layer Loop<br/>24 layers, ping-pong"}
+    end
+
+    subgraph LinearLayer["Linear Attention Layer (50%)"]
+        LN1["3. Input RMSNorm<br/>rmsnorm_kernel<br/>Grid: [128], Block: 256<br/>~0.2ms"] --> LA["4. Linear Attention<br/>forward_batch<br/>~25-30ms"]
+        LA --> LN2["5. Post RMSNorm+Residual<br/>rmsnorm_add_residual_kernel<br/>~0.2ms"]
+        LN2 --> MLP1["6. MLP<br/>forward_add_residual<br/>~6-9ms"]
+    end
+
+    subgraph FullLayer["Full Attention Layer (50%)"]
+        LN3["3. Input RMSNorm<br/>rmsnorm_kernel<br/>~0.2ms"] --> FA["4. Full Attention<br/>forward_batch_prefill<br/>~15-20ms"]
+        FA --> LN4["5. Post RMSNorm+Residual<br/>rmsnorm_add_residual_kernel<br/>~0.2ms"]
+        LN4 --> MLP2["6. MLP<br/>forward_add_residual<br/>~6-9ms"]
+    end
+
+    subgraph LinearDetail["Linear Attention 详细流程"]
+        QKV["QKV Projection<br/>cublasSgemm<br/>[128×1024]×[1024×6144]<br/>~2-3ms"] --> ABZ["A/B/Z Projection<br/>cublasSgemm ×3<br/>~1-2ms"]
+        ABZ --> Conv["Conv1D + State Update<br/>conv1d_update_fused_batch_v2<br/>~0.5ms"]
+        Conv --> L2["L2 Norm Q+K<br/>l2norm_qk_fused_batch_v2<br/>~0.2ms"]
+        L2 --> GD["⚠️ Gated Delta<br/>gated_delta_batch_fused_v2_reg<br/>~15-20ms<br/>BOTTLENECK!"]
+        GD --> NG["Norm + Gate<br/>norm_gate_fused_batch_v2<br/>~0.3ms"]
+        NG --> OutProj["Output Projection<br/>cublasSgemm<br/>~1-2ms"]
+    end
+
+    subgraph FullDetail["Full Attention 详细流程"]
+        QProj["Q Projection + RoPE<br/>batch_fused_q_path_kernel<br/>~1ms"] --> KV["K/V Cache Update<br/>batch_fused_kv_cache_kernel<br/>~0.5ms"]
+        KV --> Flash["Flash Attention v2 Prefill<br/>flash_attn_v2_prefill_kernel<br/>Grid: [(128×8+3)/4, 1]<br/>Block: 128 (4 warps)<br/>~5-8ms"]
+        Flash --> Gate["Gate Sigmoid<br/>batch_gate_sigmoid_kernel<br/>~0.2ms"]
+        Gate --> OutProj2["Output Projection<br/>cublasSgemm<br/>~1-2ms"]
+    end
+
+    subgraph MLPDetail["MLP 详细流程"]
+        GateProj["Gate Projection<br/>cublasSgemm<br/>[128×1024]×[1024×3584]<br/>~2-3ms"] --> UpProj["Up Projection<br/>cublasSgemm<br/>[128×1024]×[1024×3584]<br/>~2-3ms"]
+        UpProj --> SiLU["SiLU + Mul<br/>silu_mul_batch_kernel<br/>~0.1ms"]
+        SiLU --> DownProj["Down Projection + Residual<br/>cublasSgemm (β=1.0)<br/>[128×3584]×[3584×1024]<br/>~2-3ms"]
+    end
+
+    LayerLoop -->|偶数层| LinearLayer
+    LayerLoop -->|奇数层| FullLayer
+    LinearLayer --> LayerLoop
+    FullLayer --> LayerLoop
+    LayerLoop -->|循环结束| FinalNorm["7. Final RMSNorm<br/>~0.2ms"]
+    FinalNorm --> LMHead["8. LM Head<br/>cublasSgemm<br/>~1ms"]
+    LMHead --> End([结束])
+
+    LA -.-> LinearDetail
+    FA -.-> FullDetail
+    MLP1 -.-> MLPDetail
+    MLP2 -.-> MLPDetail
+
+    style GD fill:#ff6b6b,stroke:#c92a2a,stroke-width:3px,color:#fff
+    style Flash fill:#51cf66,stroke:#2b8a3e,stroke-width:2px
+    style Engine fill:#339af0,stroke:#1864ab,stroke-width:2px,color:#fff
+    style LinearLayer fill:#ffd43b,stroke:#f08c00,stroke-width:2px
+    style FullLayer fill:#ffd43b,stroke:#f08c00,stroke-width:2px

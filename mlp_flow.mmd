@@ -1,0 +1,28 @@
+flowchart TB
+    Input(("Input\nCPU
+*Hidden states from previous layer*IN:[] OUT:[B=32, S=512, C=2048]"))
+    style Input fill:#f8d7da
+    UpProjection(("UpProjection\ncublasSgemm **[cuBLAS]**IN:[B=32, S=512, C=2048] OUT:[B=32, S=512, C=8192]"))
+    style UpProjection fill:#d1e7dd
+    SiLU___Mul(("SiLU + Mul\nsilu_mul_kernel **[Fused]**IN:[B=32, S=512, C=8192] OUT:[B=32, S=512, C=8192]"))
+    style SiLU___Mul fill:#d1e7dd
+    DownProjection(("DownProjection\ncublasSgemm **[cuBLAS]**IN:[B=32, S=512, C=8192] OUT:[B=32, S=512, C=2048]"))
+    style DownProjection fill:#d1e7dd
+    H2D_Transfer(("H2D_Transfer\ncudaMemcpyAsyncIN:[B=32, S=512, C=2048] OUT:[B=32, S=512, C=2048]
+`0 ms`"))
+    style H2D_Transfer fill:#fff3cd
+    D2H_Transfer(("D2H_Transfer\ncudaMemcpyAsyncIN:[B=32, S=512, C=2048] OUT:[B=32, S=512, C=2048]
+`0 ms`"))
+    style D2H_Transfer fill:#cfe2ff
+    Input==>|hidden\n256 KB|H2D_Transfer
+    H2D_Transfer==>|hidden\n256 KB|UpProjection
+    UpProjection==>|intermediate\n1 MB|SiLU___Mul
+    SiLU___Mul==>|gated\n1 MB|DownProjection
+    DownProjection==>|output\n256 KB|D2H_Transfer
+
+    subgraph legend["**图例**"]
+        leg_cpu(("CPU")) style leg_cpu fill:#f8d7da,stroke:#dc3545
+        leg_gpu(("GPU")) style leg_gpu fill:#d1e7dd,stroke:#198754
+        leg_h2d{{"H2D"}} style leg_h2d fill:#fff3cd,stroke:#ffc107
+        leg_d2h{{"D2H"}} style leg_d2h fill:#cfe2ff,stroke:#0d6efd
+    end

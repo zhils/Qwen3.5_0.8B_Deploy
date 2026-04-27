@@ -32,8 +32,6 @@ class CudaMLP {
     float* d_up_proj_weight_;
     float* d_down_proj_weight_;
 
-    cublasHandle_t cublas_handle_;
-
     mutable float* d_hidden_buf_;
     mutable int max_hidden_batch_;
 

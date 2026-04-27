@@ -14,6 +14,7 @@
 |---------|-------------|------------------------|-------------|-------------|-----------|
 | RTX 5060 Ti, batch=128, prefill=1024, decode=512 | **1,497 ms** | **684.0 tok/s** (实际 87,552 tok/s) | **0.086 ms/tok** | **11,682 tok/s** | **1,541 ms** |
 | RTX 5060 Ti, batch=1, prefill=1024, decode=512 | **2,149 ms** | **444.2 tok/s** | **0.062 ms/tok** | **16,133 tok/s** | **2,181 ms** |
+| **RTX 3080 Ti, batch=1, prefill=1024, decode=512** | **2,167 ms** | **574.5 tok/s** | **0.099 ms/tok** | **10,147 tok/s** | **1,684 ms** |
 
 ### 与 llama.cpp 对比 (同硬件 RTX 5060 Ti)
 
@@ -42,7 +43,31 @@
 > - **Prefill 优势说明**：v3.1 通过内部 token 累积（BATCH_SIZE >= 32）优化，单请求 prefill 从 40.4 tok/s 提升至 444.2 tok/s，是 llama.cpp 的 2.3 倍。即使 batch=1，内部也会累积至少 32 个 token 批量处理，充分利用 GPU 并行度。
 > - **Decode 差距说明**：84x 的差距主要来自 (1) 本项目启用 CUDA Graph 消除 kernel launch 开销；(2) 全融合 kernel（SiLU+Mul、RMSNorm+Residual 等）减少 HBM 访存；(3) 预分配 buffer 无动态内存分配。llama.cpp 作为通用框架，在 0.8B 小模型上 kernel launch 和框架开销占比较高。
 
+### 三方对比 (RTX 3080 Ti, batch=1)
+
+> 数据来源：[docs/optimization/PERFORMANCE_TEST_TEMPLATE.md](docs/optimization/PERFORMANCE_TEST_TEMPLATE.md)，测试日期 2026-04-27
+
+| 指标 | vLLM (FlashAttn v2) | llama.cpp (BF16) | 本项目 (Deploy) | 最优 |
+|------|----------------------|------------------|-----------------|------|
+| **Prefill 吞吐** | 614 tok/s | **16,148 tok/s** | 574 tok/s | llama.cpp |
+| **Decode 吞吐** | 316 tok/s | 249 tok/s | **10,147 tok/s** | **Deploy** |
+| **TPOT** | 3.16 ms/token | 4.01 ms/token | **0.099 ms/token** | **Deploy** |
+| **E2E Avg (1024+512)** | **1,617 ms** | ~2,119 ms* | 1,833 ms | vLLM |
+| **E2E P50 (1024+512)** | **1,615 ms** | ~2,119 ms* | 1,684 ms | vLLM |
+| **E2E P90 (1024+512)** | **1,634 ms** | N/A | 3,122 ms | vLLM |
+| **GPU VRAM** | ~9.5 GB | N/A | 8.77 GB | Deploy |
+
+*llama.cpp E2E 为理论推算值（Prefill 63ms + Decode 2056ms），非实测
+
+**分析**：
+- **Decode 阶段**：Deploy 以 10,147 tok/s 大幅领先，TPOT 仅 0.099 ms/token，是 vLLM 的 32 倍、llama.cpp 的 40 倍
+- **Prefill 阶段**：llama.cpp 凭借标准 Attention + 极致优化达到 16,148 tok/s，是 Deploy 的 28 倍；vLLM 与 Deploy 相近（614 vs 574 tok/s）
+- **端到端**：vLLM 通过 CUDA Graph + 流水线重叠（Prefill 末尾与 Decode 首 token 重叠执行），E2E 仅 1.6s，最优；Deploy E2E 1.8s，差距缩小到 15%
+- **显存**：Deploy 占用 8.77 GB / 11.91 GB，较为高效
+
 ### 性能演进
+
+#### RTX 5060 Ti
 
 | 版本 | Prefill 吞吐 (batch=1, 单序列) | Prefill 吞吐 (batch=128, 单序列等效) | Decode 吞吐 | TTFT (batch=1) | 主要优化 |
 |------|-------------------------------|-------------------------------------|-------------|---------------|---------|
@@ -52,6 +77,12 @@
 | v3.1 (Token Accumulation) | 444.2 tok/s | 520.3 tok/s | 16,133 tok/s | 2,305 ms | 内部 Token 累积 (BATCH_SIZE >= 32) + CUDA Graph 框架 |
 | v3.2 (FlashAttention Prefill Opt) | 444.2 tok/s | 637.1 tok/s | 10,686 tok/s | 2,305 ms | FlashAttention Prefill Kernel 重构：warp-level 并行 + 消除跨 warp 同步 |
 | **v3.3 (Kernel Memory Opt)** | **444.2 tok/s** | **684.0 tok/s** (实际 87,552 tok/s) | **11,682 tok/s** | **2,149 ms** | **Gated Delta __ldg + MLP 统一 cuBLAS GEMM + Tensor Core** |
+
+#### RTX 3080 Ti (batch=1)
+
+| 版本 | Prefill 吞吐 | Decode 吞吐 | TTFT (1024 tok) | TPOT | E2E P50 (1024+512) | 主要优化 |
+|------|-------------|-------------|-----------------|------|-------------------|---------|
+| **v3.3 (实测)** | **574.5 tok/s** | **10,147 tok/s** | **2,167 ms** | **0.099 ms/tok** | **1,684 ms** | 同 v3.3 优化栈，Linux CUDA 12.8 环境 |
 
 **v3.3 相比 v1.0**: Prefill 提升 **+3,810%** (batch=128)，TTFT 降低 **-97%**
 

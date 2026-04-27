@@ -14,7 +14,8 @@
 |------|-------------|-------------|------|---------|
 | v1.0 (CUDA Baseline) | 17.5 tok/s | 12.5 tok/s | 58,400 ms | CUDA 基础实现，单 token 串行 |
 | v2.0 (FlashAttention) | 86.4 tok/s | 15,774 tok/s | 11,856 ms | FlashAttention v2 + Tensor Core + Batch Prefill |
-| **v3.0 (Batch GEMM)** | **525.6 tok/s** | **16,248 tok/s** | **1,948 ms** | **Batch Linear Attention + cuBLAS GEMM + Kernel Fusion** |
+| v3.0 (Batch GEMM) | 40.4 tok/s | 16,248 tok/s | 25,336 ms | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
+| **v3.1 (当前最佳)** | **444.2 tok/s** | **16,133 tok/s** | **2,305 ms** | **内部 Token 累积 + CUDA Graph 框架** |
 
 ---
 

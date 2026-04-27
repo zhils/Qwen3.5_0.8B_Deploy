@@ -17,8 +17,6 @@ class CudaLMHead {
 
     void forward(const float* input, float* output) const;
 
-    void forward_fp32(const float* input, float* output) const;
-
     int hidden_size() const {
         return hidden_size_;
     }
@@ -29,7 +27,6 @@ class CudaLMHead {
   private:
     int hidden_size_;
     int vocab_size_;
-    float* d_weight_fp32_;
     __nv_bfloat16* d_weight_bf16_;
     __nv_bfloat16* d_input_bf16_;
     __nv_bfloat16* d_output_bf16_;
