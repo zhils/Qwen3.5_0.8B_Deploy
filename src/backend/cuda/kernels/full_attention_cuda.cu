@@ -545,7 +545,7 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
     launch_flash_attn_v2_prefill(
         d_batch_q_buf_, kv_cache.d_k_cache, kv_cache.d_v_cache,
         d_batch_attn_out_buf_, num_heads_, num_kv_heads_, kv_head_dim_,
-        max_seq, batch_size, layer_idx, kv_cache.max_seq_len, attn_scale);
+        max_seq, batch_size, layer_idx, kv_cache.max_seq_len, attn_scale, 0);
     FA_CUDA_CHECK();
 
     dim3 gate_grid(num_heads_, batch_size);

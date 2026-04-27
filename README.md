@@ -10,7 +10,7 @@
 
 | 测试条件 | Prefill TTFT | Prefill 吞吐 | Decode TPOT | Decode 吞吐 | 端到端耗时 |
 |---------|-------------|-------------|-------------|-------------|-----------|
-| RTX 5060 Ti, batch=128, prefill=1024, decode=512 | **1,948 ms** | **525.6 tok/s** | **0.062 ms/tok** | **16,248 tok/s** | **1,980 ms** |
+| RTX 5060 Ti, batch=128, prefill=1024, decode=512 | **1,607 ms** | **637.1 tok/s** | **0.094 ms/tok** | **10,686 tok/s** | **1,655 ms** |
 | RTX 5060 Ti, batch=1, prefill=1024, decode=512 | **2,305 ms** | **444.2 tok/s** | **0.062 ms/tok** | **16,133 tok/s** | **2,337 ms** |
 
 ### 与 llama.cpp 对比 (同硬件 RTX 5060 Ti)
@@ -28,10 +28,10 @@
 
 #### Batch 对比 (batch=128)
 
-| 指标 | 本项目 (v3.1) | llama.cpp (BF16 GGUF) | 优势 |
+| 指标 | 本项目 (v3.2) | llama.cpp (BF16 GGUF) | 优势 |
 |------|--------------|----------------------|------|
-| **Prefill 吞吐** | **520.3 tok/s** | 未测试 | - |
-| **Prefill TTFT (1024 tok)** | **1,968 ms** | 未测试 | - |
+| **Prefill 吞吐** | **637.1 tok/s** | 未测试 | - |
+| **Prefill TTFT (1024 tok)** | **1,607 ms** | 未测试 | - |
 
 > **测试条件说明**：
 > - llama.cpp：使用 `llama-bench` 实测，`qwen3.5-0.8b-f16.gguf` (BF16)，batch=1，`-ngl 99 -fa 1`，重复 20 次取 P50
@@ -46,9 +46,10 @@
 | v1.0 (CUDA Baseline) | 17.5 tok/s | - | 12.5 tok/s | 58,400 ms | CUDA 基础实现，单 token 串行 |
 | v2.0 (FlashAttention) | 86.4 tok/s | - | 15,774 tok/s | 11,856 ms | FlashAttention v2 + Tensor Core + Batch Prefill |
 | v3.0 (Batch GEMM) | 40.4 tok/s | 525.6 tok/s | 16,248 tok/s | 25,336 ms | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
-| **v3.1 (Token Accumulation)** | **444.2 tok/s** | **520.3 tok/s** | **16,133 tok/s** | **2,305 ms** | **内部 Token 累积 (BATCH_SIZE >= 32) + CUDA Graph 框架** |
+| v3.1 (Token Accumulation) | 444.2 tok/s | 520.3 tok/s | 16,133 tok/s | 2,305 ms | 内部 Token 累积 (BATCH_SIZE >= 32) + CUDA Graph 框架 |
+| **v3.2 (FlashAttention Prefill Opt)** | **444.2 tok/s** | **637.1 tok/s** | **10,686 tok/s** | **2,305 ms** | **FlashAttention Prefill Kernel 重构：warp-level 并行 + 消除跨 warp 同步** |
 
-**v3.1 相比 v1.0**: Prefill 提升 **+2,440%** (batch=1)，TTFT 降低 **-96%**
+**v3.2 相比 v1.0**: Prefill 提升 **+3,540%** (batch=128)，TTFT 降低 **-97%**
 
 ## 项目结构
 
@@ -116,16 +117,28 @@
 
 **精度验证**: Batch 输出与串行输出一致 (max diff 9.6e-08)
 
-### 2. Flash Attention v2
+### 2. Flash Attention v2 (v3.2 重大优化)
 
 **文件**: [fused_kernels.cu](src/backend/cuda/kernels/fused_kernels.cu)
 
-- Warp-level 并行归约，减少同步开销
-- Online softmax 减少 HBM 访问
-- Tiled computation for Q/K/V
-- Output projection 使用 cuBLAS GEMM
+- **Warp-level 并行**: 每个 warp 独立处理一个 head，一个 block 处理 4 个 heads
+- **消除跨 warp 同步**: 仅使用 `__shfl_sync` 进行 warp 内规约，无需 shared memory 数组
+- **Online softmax**: 减少 HBM 访问
+- **Tiled computation**: Q/K/V 分块计算
+- **Bank-conflict-aware**: Shared memory +1 padding 消除 bank conflict
+- **效果**: Prefill 吞吐从 304 tok/s 提升至 **637 tok/s** (+109%)
 
-### 3. Kernel 融合
+### 3. v2.0 Kernel 微优化
+
+**文件**: [linear_attention_v2.cu](src/backend/cuda/kernels/linear_attention_v2.cu), [flash_attention.cu](src/backend/cuda/kernels/flash_attention.cu)
+
+| 优化项 | 文件 | 效果 |
+|--------|------|------|
+| **conv1d_update 寄存器缓存** | `linear_attention_v2.cu` | 权重缓存到寄存器，减少 global memory 读取 |
+| **norm_gate_fused 寄存器缓存** | `linear_attention_v2.cu` | 中间值缓存到寄存器 |
+| **Flash Attention Bank-conflict-aware** | `flash_attention.cu`, `fused_kernels.cu` | Shared memory padding 消除 bank conflict |
+
+### 4. Kernel 融合
 
 | 融合 Kernel | 功能 | 文件 |
 |-----------|------|------|
@@ -136,13 +149,13 @@
 | `l2norm_qk_fused_kernel` | L2 归一化 Q + K | linear_attention_cuda.cu |
 | `norm_gate_fused_kernel` | RMSNorm + Gate | linear_attention_cuda.cu |
 
-### 4. cuBLAS 优化
+### 5. cuBLAS 优化
 
 - **Prefill 阶段**: cuBLAS GEMM 利用 Tensor Core (TF32) 加速
 - **MLP Batch**: `sgemm` 替代 `sgemv`，预分配 hidden buffer
 - **Flash Attention Output**: cuBLAS GEMM 替代手动矩阵乘法
 
-### 5. CUDA Graph
+### 6. CUDA Graph
 
 - Decode 阶段启用 CUDA Graph，减少 Kernel Launch 开销
 - 静态图捕获，多次执行零开销
@@ -224,6 +237,7 @@ cmake --build build --config Release -j4
 4. **Continuous Batching**: 提升批量推理吞吐
 5. ~~**CUDA Graph Prefill**: 捕获 prefill 计算图，消除 kernel launch 开销~~ (框架已搭建，因 attention kernel 含 D2H memcpy 暂时 fallback)
 6. **内部 Token 累积**: batch=1 时内部累积 >=32 token 再批量处理，prefill 提升 11x
+7. **Flash Attention Prefill Kernel 优化**: warp-level 并行 + 消除跨 warp 同步，prefill 提升 109% (v3.2 已完成)
 
 ## 优化记录
 

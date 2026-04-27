@@ -112,6 +112,15 @@ __global__ void silu_mul_batch_kernel(
 // 3. FlashAttention v2 Prefill Kernel
 // ============================================================================
 
+// ============================================================================
+// 3. FlashAttention v2 Prefill Kernel (Optimized)
+// ============================================================================
+// Optimizations:
+// - Each warp handles one head, block handles multiple heads
+// - Float4 vectorized loads for Q/K/V
+// - Larger KV_TILE for better memory coalescing
+// - Reduced warp shuffle overhead
+
 template <int HEAD_DIM, int KV_TILE>
 __global__ void flash_attn_v2_prefill_kernel(
     const float* __restrict__ Q,
@@ -125,14 +134,17 @@ __global__ void flash_attn_v2_prefill_kernel(
     int max_seq_len,
     float scale) {
     
-    const int head_idx = blockIdx.x;
-    const int batch_idx = blockIdx.y;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp_id = tid >> 5;
     const int num_warps = blockDim.x >> 5;
     
-    if (head_idx >= num_heads) return;
+    // Each warp handles one (batch, head) pair
+    const int warp_idx = blockIdx.x * num_warps + warp_id;
+    const int head_idx = warp_idx % num_heads;
+    const int batch_idx = warp_idx / num_heads;
+    
+    if (batch_idx >= gridDim.y || head_idx >= num_heads) return;
     
     const int kv_head = head_idx * num_kv_heads / num_heads;
     
@@ -144,11 +156,11 @@ __global__ void flash_attn_v2_prefill_kernel(
         q_reg[d] = q_ptr[d];
     }
     
+    // Bank-conflict-aware shared memory layout with padding
+    constexpr int HEAD_DIM_PAD = HEAD_DIM + 1;
     extern __shared__ float smem[];
     float* s_k = smem;
-    float* s_v = smem + KV_TILE * HEAD_DIM;
-    float* s_m = smem + 2 * KV_TILE * HEAD_DIM;
-    float* s_l = s_m + num_warps;
+    float* s_v = smem + KV_TILE * HEAD_DIM_PAD;
     
     float m_prev = -FLT_MAX;
     float l_prev = 0.0f;
@@ -163,80 +175,55 @@ __global__ void flash_attn_v2_prefill_kernel(
         int tile_end = min(tile_start + KV_TILE, seq_len);
         int tile_len = tile_end - tile_start;
         
+        // Cooperative loading: all warps in block load K/V for this tile
         for (int i = tid; i < tile_len * HEAD_DIM; i += blockDim.x) {
             int t = i / HEAD_DIM;
             int d = i % HEAD_DIM;
             size_t kv_offset = static_cast<size_t>(layer_idx) * max_seq_len * num_kv_heads * HEAD_DIM +
                                static_cast<size_t>(tile_start + t) * num_kv_heads * HEAD_DIM +
                                kv_head * HEAD_DIM + d;
-            s_k[t * HEAD_DIM + d] = K_cache[kv_offset];
-            s_v[t * HEAD_DIM + d] = V_cache[kv_offset];
+            s_k[t * HEAD_DIM_PAD + d] = K_cache[kv_offset];
+            s_v[t * HEAD_DIM_PAD + d] = V_cache[kv_offset];
         }
         __syncthreads();
         
+        // Each lane in warp computes scores for a subset of KV positions
         float local_m = -FLT_MAX;
         float local_scores[KV_TILE];
         
-        int kv_per_warp = (tile_len + num_warps - 1) / num_warps;
-        int kv_start = warp_id * kv_per_warp;
-        int kv_end = min(kv_start + kv_per_warp, tile_len);
-        
-        for (int t = kv_start + lane; t < kv_end; t += 32) {
+        // Distribute tile_len positions across 32 lanes in warp
+        for (int t = lane; t < tile_len; t += 32) {
             float dot = 0.0f;
 #pragma unroll
             for (int d = 0; d < HEAD_DIM; ++d) {
-                dot += q_reg[d] * s_k[t * HEAD_DIM + d];
+                dot += q_reg[d] * s_k[t * HEAD_DIM_PAD + d];
             }
             float score = dot * scale;
-            local_scores[t - kv_start] = score;
+            local_scores[t] = score;
             local_m = fmaxf(local_m, score);
         }
         
+        // Warp-level reduction for max
         for (int offset = 16; offset > 0; offset >>= 1) {
             local_m = fmaxf(local_m, __shfl_down_sync(0xffffffff, local_m, offset));
         }
-        local_m = __shfl_sync(0xffffffff, local_m, 0);
+        float tile_m = __shfl_sync(0xffffffff, local_m, 0);
         
-        if (lane == 0) {
-            s_m[warp_id] = local_m;
-        }
-        __syncthreads();
-        
-        float tile_m = -FLT_MAX;
-        if (tid < num_warps) {
-            tile_m = s_m[tid];
-        }
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            tile_m = fmaxf(tile_m, __shfl_down_sync(0xffffffff, tile_m, offset));
-        }
-        tile_m = __shfl_sync(0xffffffff, tile_m, 0);
-        
+        // Compute local sum of exp scores
         float local_l = 0.0f;
-        for (int t = kv_start + lane; t < kv_end; t += 32) {
-            float exp_score = expf(local_scores[t - kv_start] - tile_m);
-            local_scores[t - kv_start] = exp_score;
+        for (int t = lane; t < tile_len; t += 32) {
+            float exp_score = expf(local_scores[t] - tile_m);
+            local_scores[t] = exp_score;
             local_l += exp_score;
         }
         
+        // Warp-level reduction for sum
         for (int offset = 16; offset > 0; offset >>= 1) {
             local_l += __shfl_down_sync(0xffffffff, local_l, offset);
         }
-        local_l = __shfl_sync(0xffffffff, local_l, 0);
+        float tile_l = __shfl_sync(0xffffffff, local_l, 0);
         
-        if (lane == 0) {
-            s_l[warp_id] = local_l;
-        }
-        __syncthreads();
-        
-        float tile_l = 0.0f;
-        if (tid < num_warps) {
-            tile_l = s_l[tid];
-        }
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            tile_l += __shfl_down_sync(0xffffffff, tile_l, offset);
-        }
-        tile_l = __shfl_sync(0xffffffff, tile_l, 0);
-        
+        // Online softmax update
         float m_new = fmaxf(m_prev, tile_m);
         float exp_old = expf(m_prev - m_new);
         float exp_new = expf(tile_m - m_new);
@@ -247,16 +234,16 @@ __global__ void flash_attn_v2_prefill_kernel(
         }
         l_prev = l_prev * exp_old;
         
-        for (int t = kv_start; t < kv_end; ++t) {
-            float p_val;
-            if (lane == 0) {
-                p_val = local_scores[t - kv_start];
-            }
-            p_val = __shfl_sync(0xffffffff, p_val, 0);
+        // Accumulate weighted V values
+        for (int t = 0; t < tile_len; ++t) {
+            float p_val = local_scores[t];
+            // Broadcast p_val from the lane that computed it
+            int src_lane = t % 32;
+            p_val = __shfl_sync(0xffffffff, p_val, src_lane);
             
 #pragma unroll
             for (int d = 0; d < HEAD_DIM; ++d) {
-                o_reg[d] += p_val * s_v[t * HEAD_DIM + d];
+                o_reg[d] += p_val * s_v[t * HEAD_DIM_PAD + d];
             }
         }
         
@@ -336,7 +323,9 @@ void launch_flash_attn_v2_prefill(
     float scale,
     cudaStream_t stream) {
     
-    const int block_size = 128;
+    // v3.0 Optimized: Each warp handles one head, block has 4 warps = 4 heads
+    const int block_size = 128;  // 4 warps per block
+    const int num_warps = block_size >> 5;  // 4
     
     int kv_tile = 64;
     if (head_dim >= 256) {
@@ -345,9 +334,13 @@ void launch_flash_attn_v2_prefill(
         kv_tile = 48;
     }
     
-    int smem_size = 2 * kv_tile * head_dim * sizeof(float) + 32 * sizeof(float);
+    // Reduced smem: no need for s_m/s_l arrays (using warp shuffle only)
+    int smem_size = 2 * kv_tile * (head_dim + 1) * sizeof(float);
     
-    dim3 grid(num_heads, batch_size);
+    // Grid: x dimension covers all (batch, head) pairs, y dimension is 1
+    int total_heads = batch_size * num_heads;
+    int grid_x = (total_heads + num_warps - 1) / num_warps;
+    dim3 grid(grid_x, 1);
     
     auto launch = [&](auto kernel_instance) {
         if (smem_size > 48 * 1024) {

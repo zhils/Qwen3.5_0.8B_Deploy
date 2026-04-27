@@ -102,10 +102,12 @@ if(ENABLE_CUDA)
         src/backend/cuda/kernels/mlp_cuda.cu
         src/backend/cuda/kernels/full_attention_cuda.cu
         src/backend/cuda/kernels/linear_attention_cuda.cu
+        src/backend/cuda/kernels/linear_attention_v2.cu
         src/backend/cuda/kernels/lm_head_cuda.cu
         src/backend/cuda/kernels/token_embedding_cuda.cu
         src/backend/cuda/kernels/gpu_sampler_argmax.cu
         src/backend/cuda/kernels/cuda_engine.cu
+        src/backend/cuda/kernels/cuda_engine_v3.cu
         src/backend/cuda/kernels/flash_attention.cu
         src/backend/cuda/kernels/vision_patch_embedding_cuda.cu
         src/backend/cuda/kernels/fa_wrapper.cpp
@@ -137,6 +139,18 @@ if(ENABLE_CUDA)
     add_executable(performance_test src/backend/cuda/performance_test.cu)
     target_link_libraries(performance_test PRIVATE qwen_cuda)
 
+    add_executable(performance_test_v3 src/backend/cuda/performance_test_v3.cu)
+    target_link_libraries(performance_test_v3 PRIVATE qwen_cuda)
+
     add_executable(verify_linear_attn_batch src/backend/cuda/verify_linear_attn_batch.cu)
     target_link_libraries(verify_linear_attn_batch PRIVATE qwen_cuda)
+
+    add_executable(v2_kernel_accuracy_validate tests/integration/v2_kernel_accuracy_validate.cu)
+    target_link_libraries(v2_kernel_accuracy_validate PRIVATE qwen_cuda)
+
+    add_executable(cuda_op_flowchart_demo tests/tools/cuda_op_flowchart_demo.cpp)
+    target_include_directories(cuda_op_flowchart_demo PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/backend/cuda/tools
+    )
+    target_link_libraries(cuda_op_flowchart_demo PRIVATE qwen_cuda)
 endif()

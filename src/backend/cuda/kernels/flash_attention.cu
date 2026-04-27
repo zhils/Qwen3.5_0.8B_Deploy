@@ -50,10 +50,12 @@ __global__ void flash_attn_v2_decode_kernel(const float* __restrict__ Q,
         q_reg[d] = q_ptr[d];
     }
 
+    // Bank-conflict-aware shared memory layout with padding
+    constexpr int HEAD_DIM_PAD = HEAD_DIM + 1;
     extern __shared__ float smem[];
     float* s_k = smem;
-    float* s_v = smem + KV_TILE * HEAD_DIM;
-    float* s_m = smem + 2 * KV_TILE * HEAD_DIM;
+    float* s_v = smem + KV_TILE * HEAD_DIM_PAD;
+    float* s_m = smem + 2 * KV_TILE * HEAD_DIM_PAD;
     float* s_l = s_m + num_warps;
 
     float m_prev = -FLT_MAX;
@@ -73,8 +75,8 @@ __global__ void flash_attn_v2_decode_kernel(const float* __restrict__ Q,
             int d = i % HEAD_DIM;
             size_t kv_offset = static_cast<size_t>(tile_start + t) * num_kv_heads * HEAD_DIM +
                                kv_head * HEAD_DIM + d;
-            s_k[t * HEAD_DIM + d] = K_cache[kv_offset];
-            s_v[t * HEAD_DIM + d] = V_cache[kv_offset];
+            s_k[t * HEAD_DIM_PAD + d] = K_cache[kv_offset];
+            s_v[t * HEAD_DIM_PAD + d] = V_cache[kv_offset];
         }
         __syncthreads();
 
@@ -89,7 +91,7 @@ __global__ void flash_attn_v2_decode_kernel(const float* __restrict__ Q,
             float dot = 0.0f;
 #pragma unroll
             for (int d = 0; d < HEAD_DIM; ++d) {
-                dot += q_reg[d] * s_k[t * HEAD_DIM + d];
+                dot += q_reg[d] * s_k[t * HEAD_DIM_PAD + d];
             }
             float score = dot * scale;
             local_scores[t - kv_start] = score;
@@ -160,7 +162,7 @@ __global__ void flash_attn_v2_decode_kernel(const float* __restrict__ Q,
 
 #pragma unroll
             for (int d = 0; d < HEAD_DIM; ++d) {
-                o_reg[d] += p_val * s_v[t * HEAD_DIM + d];
+                o_reg[d] += p_val * s_v[t * HEAD_DIM_PAD + d];
             }
         }
 
@@ -195,7 +197,7 @@ void flash_attention_decode(const float* d_Q, const float* d_K_cache, const floa
     } else if (kv_head_dim >= 128) {
         actual_kv_tile = 48;
     }
-    int smem_size = 2 * actual_kv_tile * kv_head_dim * sizeof(float) + 32 * sizeof(float);
+    int smem_size = 2 * actual_kv_tile * (kv_head_dim + 1) * sizeof(float) + 32 * sizeof(float);
 
     auto launch = [&](auto kernel_instance) {
         if (smem_size > 48 * 1024) {

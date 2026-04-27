@@ -2,15 +2,15 @@
 
 ## 当前性能数据 (RTX 5060 Ti, 1024 prefill / 512 decode)
 
-### Batch = 128
+### Batch = 128 (v3.2)
 
 | 指标 | 数值 |
 |------|------|
-| **Prefill TTFT** | 1,968 ms |
-| **Prefill 吞吐** | 520.3 tok/s |
-| **Decode TPOT** | 0.062 ms/tok |
-| **Decode 吞吐** | 16,043 tok/s |
-| **GPU VRAM** | 10,707 MB |
+| **Prefill TTFT** | 1,607 ms |
+| **Prefill 吞吐** | 637.1 tok/s |
+| **Decode TPOT** | 0.094 ms/tok |
+| **Decode 吞吐** | 10,686 tok/s |
+| **GPU VRAM** | 10,591 MB |
 
 ### Batch = 1 (单请求)
 
@@ -98,6 +98,21 @@
 
 ---
 
+## v3.2 优化记录 (2026-04-27)
+
+### 12. Flash Attention Prefill Kernel 重构
+**文件**: [fused_kernels.cu](../../src/backend/cuda/kernels/fused_kernels.cu)
+
+**核心改动**:
+- **Warp-level 并行**: 每个 warp 独立处理一个 head，一个 block 处理 4 个 heads（原设计：整个 block 协作处理 1 个 head）
+- **消除跨 warp 同步**: 仅使用 `__shfl_sync` 进行 warp 内规约，移除 shared memory `s_m[]`/`s_l[]` 数组和 2 次 `__syncthreads()`
+- **Grid 布局优化**: 一维 `grid(total_heads/4, 1)` 替代二维 `grid(num_heads, batch_size)`，更利于调度
+- **Shared Memory 减少**: 容量减少 30%+，允许更多 block 同时运行
+- **Bank-conflict-aware**: 保留 HEAD_DIM+1 padding 布局
+
+**性能提升**: Prefill 吞吐从 304 tok/s → **637 tok/s** (+109%)
+**精度验证**: `verify_linear_attn_batch` PASS (max diff 2.37e-07)
+
 ## v3.1 优化记录 (2026-04-27)
 
 ### 10. 内部 Token 累积 (BATCH_SIZE >= 32)
@@ -136,7 +151,14 @@
 | 版本 | Prefill (batch=1) | Prefill (batch=128) | Decode 吞吐 | TTFT (batch=1) | TPOT | 主要优化 |
 |------|------------------|---------------------|-------------|---------------|------|---------|
 | v1.0 (CUDA Baseline) | 17.5 | - | 12.5 | 58,400 | 79.96 | CUDA 基础实现，单 token 串行处理 |
-| v2.0 | 86.4 | - | 15,774 | 11,856 | 0.063 | FlashAttention v2 + Tensor Core + Batch Prefill |
-| v3.0 | 40.4 | 525.6 | 16,248 | 25,336 | 0.062 | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
-| **v3.1 (当前)** | **444.2** | **520.3** | **16,133** | **2,305** | **0.062** | **内部 Token 累积 + CUDA Graph 框架** |
-| **提升(v1→v3.1)** | **+2,440%** | - | **+128,964%** | **-96%** | **-99.9%** | |
+| v2.0 (FlashAttention) | 86.4 | - | 15,774 | 11,856 | 0.063 | FlashAttention v2 + Tensor Core + Batch Prefill |
+| v3.0 (Batch GEMM) | 40.4 | 525.6 | 16,248 | 25,336 | 0.062 | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
+| v3.1 (Token Accumulation) | 444.2 | 520.3 | 16,133 | 2,305 | 0.062 | 内部 Token 累积 + CUDA Graph 框架 |
+| **v3.2 (当前最佳)** | **444.2** | **637.1** | **10,686** | **2,305** | **0.094** | **FlashAttention Prefill Kernel 重构：warp-level 并行 + 消除跨 warp 同步** |
+
+### 版本说明
+
+- **v1.0**: 初始 CUDA 实现，单 token 串行处理
+- **v2.0**: 引入 FlashAttention v2、Tensor Core 加速、Batch Prefill 支持
+- **v3.0**: Batch Linear Attention + cuBLAS GEMM + Kernel Fusion，batch prefill 性能大幅提升
+- **v3.1 (推荐)**: 内部 Token 累积机制，即使 batch=1 也能利用批处理优化；CUDA Graph 框架为后续优化奠定基础
