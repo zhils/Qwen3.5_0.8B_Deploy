@@ -353,28 +353,31 @@ __global__ void gated_delta_batch_fused_v2_reg_kernel(
     }
 
     for (int b = 0; b < batch_size; ++b) {
-        float b_sig = 1.0f / (1.0f + expf(-b_raw[b * num_heads + head_idx]));
-        float sp = a[b * num_heads + head_idx] + dt_bias[head_idx];
+        // Use __ldg for read-only data to leverage L2 cache
+        float b_sig = 1.0f / (1.0f + expf(-__ldg(&b_raw[b * num_heads + head_idx])));
+        float sp = __ldg(&a[b * num_heads + head_idx]) + __ldg(&dt_bias[head_idx]);
         sp = (sp > 20.0f) ? sp : logf(1.0f + expf(sp));
-        float g_t = expf(-expf(a_log[head_idx]) * sp);
+        float g_t = expf(-expf(__ldg(&a_log[head_idx])) * sp);
 
         const float* k_ptr = conv_out + b * conv_dim + num_heads * key_dim + head_idx * key_dim;
         const float* q_ptr = conv_out + b * conv_dim + head_idx * key_dim;
         const float* v_ptr = conv_out + b * conv_dim + 2 * num_heads * key_dim + head_idx * value_dim;
 
         float kv_mem = 0.0f;
+        #pragma unroll 4
         for (int kd = 0; kd < key_dim; ++kd) {
             state_reg[kd] *= g_t;
-            kv_mem += state_reg[kd] * k_ptr[kd];
+            kv_mem += state_reg[kd] * __ldg(&k_ptr[kd]);
         }
 
-        float v_val = v_ptr[tidx];
+        float v_val = __ldg(&v_ptr[tidx]);
         float delta = (v_val - kv_mem) * b_sig;
 
         float sum = 0.0f;
+        #pragma unroll 4
         for (int kd = 0; kd < key_dim; ++kd) {
-            state_reg[kd] += k_ptr[kd] * delta;
-            sum += state_reg[kd] * q_ptr[kd];
+            state_reg[kd] += __ldg(&k_ptr[kd]) * delta;
+            sum += state_reg[kd] * __ldg(&q_ptr[kd]);
         }
 
         attn_out[b * z_dim + head_idx * value_dim + tidx] = sum;

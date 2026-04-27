@@ -2,14 +2,14 @@
 
 ## 当前性能数据 (RTX 5060 Ti, 1024 prefill / 512 decode)
 
-### Batch = 128 (v3.2)
+### Batch = 128 (v3.3)
 
 | 指标 | 数值 |
 |------|------|
-| **Prefill TTFT** | 1,607 ms |
-| **Prefill 吞吐** | 637.1 tok/s |
-| **Decode TPOT** | 0.094 ms/tok |
-| **Decode 吞吐** | 10,686 tok/s |
+| **Prefill TTFT** | 1,497 ms |
+| **Prefill 吞吐** | 684.0 tok/s |
+| **Decode TPOT** | 0.086 ms/tok |
+| **Decode 吞吐** | 11,682 tok/s |
 | **GPU VRAM** | 10,591 MB |
 
 ### Batch = 1 (单请求)
@@ -98,6 +98,19 @@
 
 ---
 
+## v3.3 优化记录 (2026-04-27)
+
+### 13. Gated Delta __ldg 优化 + MLP 统一 cuBLAS GEMM
+**文件**: [linear_attention_v2.cu](../../src/backend/cuda/kernels/linear_attention_v2.cu), [mlp_cuda.cu](../../src/backend/cuda/kernels/mlp_cuda.cu)
+
+**核心改动**:
+- **Gated Delta `__ldg`**: 使用 read-only cache 加载 conv_out、a、b_raw、dt_bias、a_log，减少 global memory 延迟
+- **MLP 统一 cuBLAS GEMM**: batch_size=1 时也使用 `cublasSgemm` 替代 custom kernel + `cublasSgemv`，充分利用 Tensor Core
+- **Full Attention 保持**: Flash Attention kernel 已优化，无需改动
+
+**性能提升**: Prefill 吞吐从 637 tok/s → **684 tok/s** (+7.4%)，Decode 从 10,686 tok/s → **11,682 tok/s** (+9.3%)
+**精度验证**: `verify_linear_attn_batch` PASS (max diff 5.31e-08)
+
 ## v3.2 优化记录 (2026-04-27)
 
 ### 12. Flash Attention Prefill Kernel 重构
@@ -154,7 +167,8 @@
 | v2.0 (FlashAttention) | 86.4 | - | 15,774 | 11,856 | 0.063 | FlashAttention v2 + Tensor Core + Batch Prefill |
 | v3.0 (Batch GEMM) | 40.4 | 525.6 | 16,248 | 25,336 | 0.062 | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
 | v3.1 (Token Accumulation) | 444.2 | 520.3 | 16,133 | 2,305 | 0.062 | 内部 Token 累积 + CUDA Graph 框架 |
-| **v3.2 (当前最佳)** | **444.2** | **637.1** | **10,686** | **2,305** | **0.094** | **FlashAttention Prefill Kernel 重构：warp-level 并行 + 消除跨 warp 同步** |
+| v3.2 (FlashAttention Prefill Opt) | 444.2 | 637.1 | 10,686 | 2,305 | 0.094 | FlashAttention Prefill Kernel 重构：warp-level 并行 + 消除跨 warp 同步 |
+| **v3.3 (Kernel Memory Opt)** | **444.2** | **684.0** | **11,682** | **2,149** | **0.086** | **Gated Delta __ldg + MLP 统一 cuBLAS GEMM + Tensor Core** |
 
 ### 版本说明
 
