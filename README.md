@@ -8,9 +8,11 @@
 
 ### 核心性能指标
 
-| 测试条件 | Prefill TTFT | Prefill 吞吐 | Decode TPOT | Decode 吞吐 | 端到端耗时 |
-|---------|-------------|-------------|-------------|-------------|-----------|
-| RTX 5060 Ti, batch=128, prefill=1024, decode=512 | **1,497 ms** | **684.0 tok/s** | **0.086 ms/tok** | **11,682 tok/s** | **1,541 ms** |
+> **吞吐量说明**：Prefill 吞吐量为**单序列等效吞吐量**（总处理 token 数 / 总时间），非 batch 总吞吐量。实际 batch 总吞吐量 = 单序列等效吞吐量 × batch_size。
+
+| 测试条件 | Prefill TTFT | Prefill 吞吐 (单序列等效) | Decode TPOT | Decode 吞吐 | 端到端耗时 |
+|---------|-------------|------------------------|-------------|-------------|-----------|
+| RTX 5060 Ti, batch=128, prefill=1024, decode=512 | **1,497 ms** | **684.0 tok/s** (实际 87,552 tok/s) | **0.086 ms/tok** | **11,682 tok/s** | **1,541 ms** |
 | RTX 5060 Ti, batch=1, prefill=1024, decode=512 | **2,149 ms** | **444.2 tok/s** | **0.062 ms/tok** | **16,133 tok/s** | **2,181 ms** |
 
 ### 与 llama.cpp 对比 (同硬件 RTX 5060 Ti)
@@ -30,7 +32,8 @@
 
 | 指标 | 本项目 (v3.3) | llama.cpp (BF16 GGUF) | 优势 |
 |------|--------------|----------------------|------|
-| **Prefill 吞吐** | **684.0 tok/s** | 未测试 | - |
+| **Prefill 吞吐 (单序列等效)** | **684.0 tok/s** (实际 87,552 tok/s) | 未测试 | - |
+| **Prefill 吞吐 (batch 总吞吐)** | **87,552 tok/s** | 未测试 | - |
 | **Prefill TTFT (1024 tok)** | **1,497 ms** | 未测试 | - |
 
 > **测试条件说明**：
@@ -41,14 +44,14 @@
 
 ### 性能演进
 
-| 版本 | Prefill 吞吐 (batch=1) | Prefill 吞吐 (batch=128) | Decode 吞吐 | TTFT (batch=1) | 主要优化 |
-|------|----------------------|-------------------------|-------------|---------------|---------|
+| 版本 | Prefill 吞吐 (batch=1, 单序列) | Prefill 吞吐 (batch=128, 单序列等效) | Decode 吞吐 | TTFT (batch=1) | 主要优化 |
+|------|-------------------------------|-------------------------------------|-------------|---------------|---------|
 | v1.0 (CUDA Baseline) | 17.5 tok/s | - | 12.5 tok/s | 58,400 ms | CUDA 基础实现，单 token 串行 |
 | v2.0 (FlashAttention) | 86.4 tok/s | - | 15,774 tok/s | 11,856 ms | FlashAttention v2 + Tensor Core + Batch Prefill |
 | v3.0 (Batch GEMM) | 40.4 tok/s | 525.6 tok/s | 16,248 tok/s | 25,336 ms | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
 | v3.1 (Token Accumulation) | 444.2 tok/s | 520.3 tok/s | 16,133 tok/s | 2,305 ms | 内部 Token 累积 (BATCH_SIZE >= 32) + CUDA Graph 框架 |
-| v3.2 (FlashAttention Prefill Opt) | 444.2 tok/s | 637.1 tok/s | 10,686 tok/s | 2,305 ms | 0.094 ms | FlashAttention Prefill Kernel 重构：warp-level 并行 + 消除跨 warp 同步 |
-| **v3.3 (Kernel Memory Opt)** | **444.2 tok/s** | **684.0 tok/s** | **11,682 tok/s** | **2,149 ms** | **0.086 ms** | **Gated Delta __ldg + MLP 统一 cuBLAS GEMM + Tensor Core** |
+| v3.2 (FlashAttention Prefill Opt) | 444.2 tok/s | 637.1 tok/s | 10,686 tok/s | 2,305 ms | FlashAttention Prefill Kernel 重构：warp-level 并行 + 消除跨 warp 同步 |
+| **v3.3 (Kernel Memory Opt)** | **444.2 tok/s** | **684.0 tok/s** (实际 87,552 tok/s) | **11,682 tok/s** | **2,149 ms** | **Gated Delta __ldg + MLP 统一 cuBLAS GEMM + Tensor Core** |
 
 **v3.3 相比 v1.0**: Prefill 提升 **+3,810%** (batch=128)，TTFT 降低 **-97%**
 
