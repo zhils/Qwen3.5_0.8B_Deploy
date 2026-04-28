@@ -1,4 +1,5 @@
 #include "lm_head_cuda.hpp"
+#include "cublas_handle_pool.hpp"
 #include "cuda_error_handling.cuh"
 #include <stdexcept>
 #include <string>
@@ -45,24 +46,20 @@ __global__ void bf16_to_fp32_kernel(const __nv_bfloat16* __restrict__ bf16_data,
 
 CudaLMHead::CudaLMHead(int hidden_size, int vocab_size)
     : hidden_size_(hidden_size), vocab_size_(vocab_size),
-      d_weight_bf16_(nullptr), d_input_bf16_(nullptr), d_output_bf16_(nullptr) {
-    size_t weight_size = static_cast<size_t>(vocab_size_) * hidden_size_;
-    CUDA_CHECK(cudaMalloc(&d_weight_bf16_, weight_size * sizeof(__nv_bfloat16)));
+      d_weight_bf16_(nullptr), d_input_bf16_(nullptr), d_output_bf16_(nullptr),
+      owns_weight_(false), weight_set_(false) {
     CUDA_CHECK(cudaMalloc(&d_input_bf16_, hidden_size_ * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&d_output_bf16_, vocab_size_ * sizeof(__nv_bfloat16)));
-    CUBLAS_CHECK(cublasCreate(&cublas_handle_));
-    weight_converted_ = false;
 }
 
 CudaLMHead::~CudaLMHead() {
-    if (d_weight_bf16_)
+    if (owns_weight_ && d_weight_bf16_) {
         cudaFree(d_weight_bf16_);
+    }
     if (d_input_bf16_)
         cudaFree(d_input_bf16_);
     if (d_output_bf16_)
         cudaFree(d_output_bf16_);
-    if (cublas_handle_)
-        cublasDestroy(cublas_handle_);
 }
 
 void CudaLMHead::set_weight(const std::vector<float>& weight) {
@@ -73,21 +70,38 @@ void CudaLMHead::set_weight(const std::vector<float>& weight) {
                                     std::to_string(weight.size()));
     }
 
-    float* d_temp_fp32 = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_temp_fp32, weight_size * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_temp_fp32, weight.data(), weight_size * sizeof(float),
-                          cudaMemcpyHostToDevice));
+    if (owns_weight_ && d_weight_bf16_) {
+        cudaFree(d_weight_bf16_);
+    }
 
-    dim3 block(256);
-    dim3 grid((weight_size + 255) / 256);
-    fp32_to_bf16_kernel<<<grid, block>>>(d_temp_fp32, d_weight_bf16_, weight_size);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaFree(d_temp_fp32));
+    CUDA_CHECK(cudaMalloc(&d_weight_bf16_, weight_size * sizeof(__nv_bfloat16)));
 
-    weight_converted_ = true;
+    std::vector<__nv_bfloat16> h_weight_bf16(weight_size);
+    for (size_t i = 0; i < weight_size; ++i) {
+        h_weight_bf16[i] = __float2bfloat16(weight[i]);
+    }
+
+    CUDA_CHECK(cudaMemcpy(d_weight_bf16_, h_weight_bf16.data(), 
+                          weight_size * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+
+    owns_weight_ = true;
+    weight_set_ = true;
+}
+
+void CudaLMHead::set_weight_bf16_ptr(__nv_bfloat16* d_weight_bf16) {
+    if (owns_weight_ && d_weight_bf16_) {
+        cudaFree(d_weight_bf16_);
+    }
+    d_weight_bf16_ = d_weight_bf16;
+    owns_weight_ = false;
+    weight_set_ = true;
 }
 
 void CudaLMHead::forward(const float* input, float* output) const {
+    if (!weight_set_ || !d_weight_bf16_) {
+        throw std::runtime_error("CudaLMHead: weight not set");
+    }
+
     dim3 block(256);
 
     dim3 grid_in((hidden_size_ + 255) / 256);
@@ -97,7 +111,8 @@ void CudaLMHead::forward(const float* input, float* output) const {
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    CUBLAS_CHECK(cublasGemmEx(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N, vocab_size_, 1,
+    cublasHandle_t handle = CublasHandlePool::instance().get();
+    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, vocab_size_, 1,
                               hidden_size_, &alpha, static_cast<const void*>(d_weight_bf16_),
                               CUDA_R_16BF, hidden_size_, static_cast<const void*>(d_input_bf16_),
                               CUDA_R_16BF, hidden_size_, &beta, static_cast<void*>(d_output_bf16_),

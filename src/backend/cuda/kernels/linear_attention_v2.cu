@@ -1,4 +1,5 @@
 #include "linear_attention_v2.cuh"
+#include "cublas_handle_pool.hpp"
 #include "cuda_utils.cuh"
 #include "cuda_error_handling.cuh"
 #include <cublas_v2.h>
@@ -393,7 +394,7 @@ __global__ void gated_delta_batch_fused_v2_reg_kernel(
 CudaLinearAttentionV2::CudaLinearAttentionV2(int hidden_size, int num_heads, int key_dim,
                                              int value_dim, int conv_kernel)
     : hidden_size_(hidden_size), num_heads_(num_heads), key_dim_(key_dim), value_dim_(value_dim),
-      conv_kernel_(conv_kernel), cublas_handle_(nullptr), d_batch_mixed_qkv_buf_(nullptr),
+      conv_kernel_(conv_kernel), d_batch_mixed_qkv_buf_(nullptr),
       d_batch_conv_out_buf_(nullptr), d_batch_a_buf_(nullptr), d_batch_b_raw_buf_(nullptr),
       d_batch_z_buf_(nullptr), d_batch_attn_out_buf_(nullptr), d_batch_conv_state_buf_(nullptr),
       d_scan_g_buf_(nullptr), d_scan_b_vec_buf_(nullptr), max_batch_size_(0) {
@@ -420,14 +421,6 @@ CudaLinearAttentionV2::CudaLinearAttentionV2(int hidden_size, int num_heads, int
     cudaMalloc(&d_attn_out_buf_, static_cast<size_t>(z_dim) * sizeof(float));
     cudaMalloc(&d_z_buf_, static_cast<size_t>(z_dim) * sizeof(float));
 
-    LA_V2_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
-    cublasSetMathMode(cublas_handle_, CUBLAS_TF32_TENSOR_OP_MATH);
-
-    // Preallocate cuBLAS workspace for CUDA Graph support
-    size_t cublas_workspace_size = 32 * 1024 * 1024; // 32MB
-    cudaMalloc(&d_cublas_workspace_, cublas_workspace_size);
-    cublasSetWorkspace(cublas_handle_, d_cublas_workspace_, cublas_workspace_size);
-
     const int PREALLOC_BATCH_SIZE = 128;
     ensure_batch_buffers(PREALLOC_BATCH_SIZE);
 }
@@ -449,15 +442,6 @@ CudaLinearAttentionV2::~CudaLinearAttentionV2() {
     if (d_b_raw_buf_) cudaFree(d_b_raw_buf_);
     if (d_attn_out_buf_) cudaFree(d_attn_out_buf_);
     if (d_z_buf_) cudaFree(d_z_buf_);
-
-    if (d_cublas_workspace_) cudaFree(d_cublas_workspace_);
-    if (cublas_handle_) cublasDestroy(cublas_handle_);
-}
-
-void CudaLinearAttentionV2::set_stream(cudaStream_t stream) const {
-    if (cublas_handle_) {
-        cublasSetStream(cublas_handle_, stream);
-    }
 }
 
 void CudaLinearAttentionV2::ensure_batch_buffers(int batch_size) const {
@@ -617,7 +601,8 @@ void CudaLinearAttentionV2::forward_batch(const float* input, float* output,
     }
 
     ensure_batch_buffers(batch_size);
-    cublasSetStream(cublas_handle_, stream);
+    cublasHandle_t cublas_handle = CublasHandlePool::instance().get();
+    cublasSetStream(cublas_handle, stream);
 
     int k_dim = num_heads_ * key_dim_;
     int v_dim = num_heads_ * value_dim_;
@@ -641,25 +626,25 @@ void CudaLinearAttentionV2::forward_batch(const float* input, float* output,
 
     const float alpha = 1.0f, beta = 0.0f;
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                     conv_dim, batch_size, hidden_size_,
                                     &alpha, d_in_proj_qkv_weight_, hidden_size_,
                                     input, hidden_size_,
                                     &beta, d_mixed_qkv, conv_dim));
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                     num_heads_, batch_size, hidden_size_,
                                     &alpha, d_in_proj_a_weight_, hidden_size_,
                                     input, hidden_size_,
                                     &beta, d_a, num_heads_));
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                     num_heads_, batch_size, hidden_size_,
                                     &alpha, d_in_proj_b_weight_, hidden_size_,
                                     input, hidden_size_,
                                     &beta, d_b_raw, num_heads_));
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                     z_dim, batch_size, hidden_size_,
                                     &alpha, d_in_proj_z_weight_, hidden_size_,
                                     input, hidden_size_,
@@ -692,7 +677,7 @@ void CudaLinearAttentionV2::forward_batch(const float* input, float* output,
         d_attn_out, d_norm_weight_, d_z, num_heads_, value_dim_, l2norm_eps, batch_size);
     CUDA_CHECK_LAST_KERNEL();
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                     hidden_size_, batch_size, z_dim,
                                     &alpha, d_out_proj_weight_, z_dim,
                                     d_attn_out, z_dim,

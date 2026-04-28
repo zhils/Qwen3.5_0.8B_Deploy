@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <vector>
 #include <memory>
 #include <string>
@@ -8,6 +9,7 @@
 #include "rmsnorm_cuda.hpp"
 #include "mlp_cuda.hpp"
 #include "lm_head_cuda.hpp"
+#include "token_embedding_cuda.hpp"
 #include "full_attention_cuda.hpp"
 
 namespace qwen {
@@ -65,11 +67,19 @@ class CudaEngineV3 {
     void set_layer_weights(int layer_idx, const std::vector<float>& weights_flat);
     void set_final_norm_weight(const std::vector<float>& weight);
     void set_lm_head_weight(const std::vector<float>& weight);
+    
+    void set_shared_embedding_lmhead_weight(const std::vector<float>& weight);
+    
+    void set_embedding_weight(const std::vector<float>& weight);
 
     void forward(const float* d_input, float* d_output, int position);
 
     void forward_batch_prefill(const float* d_input, float* d_output, const int* positions,
                                int batch_size);
+    
+    void forward_token(int token_id, float* d_output, int position);
+    
+    void forward_tokens(const std::vector<int>& token_ids, float* d_output, const int* positions);
 
     void forward_host(const std::vector<float>& input, std::vector<float>& output, int position);
 
@@ -81,6 +91,8 @@ class CudaEngineV3 {
 
     size_t gpu_memory_bytes() const { return gpu_memory_bytes_; }
     bool ready() const { return ready_; }
+    
+    CudaTokenEmbedding* embedding() { return embedding_.get(); }
 
   private:
     int num_layers_;
@@ -94,8 +106,11 @@ class CudaEngineV3 {
     std::vector<std::unique_ptr<CudaLayerV3>> layers_;
     std::unique_ptr<CudaRMSNorm> final_norm_;
     std::unique_ptr<CudaLMHead> lm_head_;
+    std::unique_ptr<CudaTokenEmbedding> embedding_;
 
     CudaKVCache kv_cache_;
+    
+    __nv_bfloat16* d_shared_embedding_lmhead_weight_;
 
     float* d_input_buf_;
     float* d_normed_input_;

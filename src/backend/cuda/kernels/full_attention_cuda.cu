@@ -236,34 +236,87 @@ void CudaFullAttention::set_weights(const std::vector<float>& q_proj_weight,
                cudaMemcpyHostToDevice);
 }
 
-void CudaKVCache::reset(int nl, int nkh, int hd, int max_len) {
+void CudaKVCache::reset(int nl, int nkh, int hd, int init_capacity) {
     num_layers = nl;
     num_kv_heads = nkh;
     head_dim = hd;
-    max_seq_len = max_len;
+    max_seq_len = 0;
+    capacity_seq_len = init_capacity;
     layer_lengths.assign(num_layers, 0);
 
-    size_t total = static_cast<size_t>(nl) * max_len * nkh * hd;
+    size_t total = static_cast<size_t>(nl) * capacity_seq_len * nkh * hd;
     cudaMalloc(&d_k_cache, total * sizeof(float));
     cudaMalloc(&d_v_cache, total * sizeof(float));
     cudaMemset(d_k_cache, 0, total * sizeof(float));
     cudaMemset(d_v_cache, 0, total * sizeof(float));
 }
 
+void CudaKVCache::grow(int new_capacity) {
+    if (new_capacity <= capacity_seq_len) return;
+
+    size_t old_total = static_cast<size_t>(num_layers) * capacity_seq_len * num_kv_heads * head_dim;
+    size_t new_total = static_cast<size_t>(num_layers) * new_capacity * num_kv_heads * head_dim;
+
+    float* new_k_cache = nullptr;
+    float* new_v_cache = nullptr;
+    cudaMalloc(&new_k_cache, new_total * sizeof(float));
+    cudaMalloc(&new_v_cache, new_total * sizeof(float));
+    cudaMemset(new_k_cache, 0, new_total * sizeof(float));
+    cudaMemset(new_v_cache, 0, new_total * sizeof(float));
+
+    // 拷贝旧数据
+    if (d_k_cache && old_total > 0) {
+        cudaMemcpy(new_k_cache, d_k_cache, old_total * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+    if (d_v_cache && old_total > 0) {
+        cudaMemcpy(new_v_cache, d_v_cache, old_total * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+
+    cudaFree(d_k_cache);
+    cudaFree(d_v_cache);
+
+    d_k_cache = new_k_cache;
+    d_v_cache = new_v_cache;
+    capacity_seq_len = new_capacity;
+}
+
+void CudaKVCache::ensure_capacity(int required_seq_len) {
+    if (required_seq_len <= capacity_seq_len) return;
+
+    // 2倍扩容策略，但不超过合理上限
+    int new_capacity = capacity_seq_len * 2;
+    while (new_capacity < required_seq_len) {
+        new_capacity *= 2;
+    }
+    // 设置一个合理的上限，防止无限增长
+    const int MAX_REASONABLE_SEQ_LEN = 262144;
+    if (new_capacity > MAX_REASONABLE_SEQ_LEN) {
+        new_capacity = MAX_REASONABLE_SEQ_LEN;
+    }
+
+    grow(new_capacity);
+}
+
 void CudaKVCache::clear() {
     if (d_k_cache) {
-        size_t total = static_cast<size_t>(num_layers) * max_seq_len * num_kv_heads * head_dim;
+        size_t total = static_cast<size_t>(num_layers) * capacity_seq_len * num_kv_heads * head_dim;
         cudaMemset(d_k_cache, 0, total * sizeof(float));
     }
     if (d_v_cache) {
-        size_t total = static_cast<size_t>(num_layers) * max_seq_len * num_kv_heads * head_dim;
+        size_t total = static_cast<size_t>(num_layers) * capacity_seq_len * num_kv_heads * head_dim;
         cudaMemset(d_v_cache, 0, total * sizeof(float));
     }
     std::fill(layer_lengths.begin(), layer_lengths.end(), 0);
+    max_seq_len = 0;
 }
 
 void CudaFullAttention::forward(const float* input, float* output, CudaKVCache& kv_cache,
                                 int layer_idx, int position) const {
+    kv_cache.ensure_capacity(position + 1);
+    if (position + 1 > kv_cache.max_seq_len) {
+        kv_cache.max_seq_len = position + 1;
+    }
+
     int total_q = num_heads_ * q_head_dim_;
     int total_kv = num_kv_heads_ * kv_head_dim_;
     int total_out = num_heads_ * kv_head_dim_;
@@ -284,7 +337,7 @@ void CudaFullAttention::forward(const float* input, float* output, CudaKVCache& 
     FA_CUDA_CHECK();
 
     size_t k_offset =
-        static_cast<size_t>(layer_idx) * kv_cache.max_seq_len * num_kv_heads_ * kv_head_dim_ +
+        static_cast<size_t>(layer_idx) * kv_cache.capacity_seq_len * num_kv_heads_ * kv_head_dim_ +
         static_cast<size_t>(position) * num_kv_heads_ * kv_head_dim_;
     size_t shmem_kv = 2 * kv_head_dim_ * sizeof(float);
     fused_kv_cache_kernel<<<num_kv_heads_, 256, shmem_kv>>>(
@@ -295,10 +348,10 @@ void CudaFullAttention::forward(const float* input, float* output, CudaKVCache& 
     kv_cache.layer_lengths[layer_idx] += 1;
 
     const float* k_ptr = kv_cache.d_k_cache + static_cast<size_t>(layer_idx) *
-                                                  kv_cache.max_seq_len * num_kv_heads_ *
+                                                  kv_cache.capacity_seq_len * num_kv_heads_ *
                                                   kv_head_dim_;
     const float* v_ptr = kv_cache.d_v_cache + static_cast<size_t>(layer_idx) *
-                                                  kv_cache.max_seq_len * num_kv_heads_ *
+                                                  kv_cache.capacity_seq_len * num_kv_heads_ *
                                                   kv_head_dim_;
 
     float attn_scale = 1.0f / sqrtf(static_cast<float>(q_head_dim_));
@@ -508,6 +561,20 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
                                               int max_seq) const {
     ensure_batch_buffers(batch_size);
 
+    int actual_max_seq = max_seq;
+    if (actual_max_seq == 0) {
+        std::vector<int> h_positions(batch_size);
+        cudaMemcpy(h_positions.data(), positions, batch_size * sizeof(int), cudaMemcpyDeviceToHost);
+        for (int b = 0; b < batch_size; ++b) {
+            actual_max_seq = std::max(actual_max_seq, h_positions[b] + 1);
+        }
+    }
+    
+    kv_cache.ensure_capacity(actual_max_seq);
+    if (actual_max_seq > kv_cache.max_seq_len) {
+        kv_cache.max_seq_len = actual_max_seq;
+    }
+
     int rotary_dim = static_cast<int>(kv_head_dim_ * 0.25f);
     int total_out = num_heads_ * kv_head_dim_;
 
@@ -523,24 +590,17 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
     batch_fused_kv_cache_kernel<<<kv_grid, 256, shmem_kv>>>(
         input, d_k_proj_weight_, d_v_proj_weight_, d_k_norm_weight_,
         kv_cache.d_k_cache, kv_cache.d_v_cache, hidden_size_, num_kv_heads_, kv_head_dim_,
-        rotary_dim, 10000000.0f, positions, 1e-6f, batch_size, layer_idx, kv_cache.max_seq_len);
+        rotary_dim, 10000000.0f, positions, 1e-6f, batch_size, layer_idx, kv_cache.capacity_seq_len);
     FA_CUDA_CHECK();
 
-    // Use precomputed max_seq if provided (for CUDA Graph compatibility)
-    // Otherwise compute from positions (fallback for non-graph path)
-    int actual_max_seq = max_seq;
-    if (actual_max_seq == 0) {
+    if (max_seq == 0) {
         std::vector<int> h_positions(batch_size);
         cudaMemcpy(h_positions.data(), positions, batch_size * sizeof(int), cudaMemcpyDeviceToHost);
         for (int b = 0; b < batch_size; ++b) {
             kv_cache.layer_lengths[layer_idx] = std::max(kv_cache.layer_lengths[layer_idx], 
                                                           h_positions[b] + 1);
         }
-        for (int b = 0; b < batch_size; ++b) {
-            actual_max_seq = std::max(actual_max_seq, h_positions[b] + 1);
-        }
     } else {
-        // Update layer_lengths with precomputed max_seq
         kv_cache.layer_lengths[layer_idx] = std::max(kv_cache.layer_lengths[layer_idx], actual_max_seq);
     }
 
@@ -548,7 +608,7 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
     launch_flash_attn_v2_prefill(
         d_batch_q_buf_, kv_cache.d_k_cache, kv_cache.d_v_cache,
         d_batch_attn_out_buf_, num_heads_, num_kv_heads_, kv_head_dim_,
-        actual_max_seq, batch_size, layer_idx, kv_cache.max_seq_len, attn_scale, 0);
+        actual_max_seq, batch_size, layer_idx, kv_cache.capacity_seq_len, attn_scale, 0);
     FA_CUDA_CHECK();
 
     dim3 gate_grid(num_heads_, batch_size);
@@ -556,9 +616,6 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
         d_batch_attn_out_buf_, d_batch_gate_buf_, num_heads_, kv_head_dim_, q_head_dim_, batch_size);
     FA_CUDA_CHECK();
 
-    // Use cuBLAS GEMM for output projection: output = attn_out × o_weight^T
-    // attn_out: [batch_size, total_out], o_weight: [hidden_size, total_out]
-    // output = attn_out × o_weight^T  =>  [batch_size, total_out] × [total_out, hidden_size]
     cublasHandle_t handle = CublasHandlePool::instance().get();
     const float alpha = 1.0f, beta = 0.0f;
     FA_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,

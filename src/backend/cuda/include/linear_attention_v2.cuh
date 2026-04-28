@@ -29,8 +29,6 @@ class CudaLinearAttentionV2 {
     void forward_batch(const float* input, float* output, CudaLinearAttnState& state,
                        int batch_size, cudaStream_t stream = 0) const;
 
-    void set_stream(cudaStream_t stream) const;
-
     int hidden_size() const { return hidden_size_; }
     int num_heads() const { return num_heads_; }
 
@@ -57,9 +55,6 @@ class CudaLinearAttentionV2 {
     float* d_b_raw_buf_;
     float* d_attn_out_buf_;
     float* d_z_buf_;
-
-    cublasHandle_t cublas_handle_;
-    float* d_cublas_workspace_ = nullptr;
 
     mutable float* d_batch_mixed_qkv_buf_;
     mutable float* d_batch_conv_out_buf_;

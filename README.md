@@ -27,7 +27,7 @@
 | **Prefill TTFT (1024 tok)** | **2,305 ms** | **5,301 ms** | **2.30x** |
 | **Decode TPOT** | **0.062 ms** | **5.21 ms** | **84.0x** |
 | **端到端耗时 (1024+512)** | **2,337 ms** | **7,971 ms** | **3.41x** |
-| **显存占用** | 10,445 MB | 2,298 MB | - |
+| **显存占用** | ~4,070 MB | 2,298 MB | - |
 
 #### Batch 对比 (batch=128)
 
@@ -55,7 +55,7 @@
 | **E2E Avg (1024+512)** | **1,617 ms** | ~2,119 ms* | 1,833 ms | vLLM |
 | **E2E P50 (1024+512)** | **1,615 ms** | ~2,119 ms* | 1,684 ms | vLLM |
 | **E2E P90 (1024+512)** | **1,634 ms** | N/A | 3,122 ms | vLLM |
-| **GPU VRAM** | ~9.5 GB | N/A | 8.77 GB | Deploy |
+| **GPU VRAM** | ~9.5 GB | N/A | ~4.0 GB | Deploy |
 
 *llama.cpp E2E 为理论推算值（Prefill 63ms + Decode 2056ms），非实测
 
@@ -63,7 +63,7 @@
 - **Decode 阶段**：Deploy 以 10,147 tok/s 大幅领先，TPOT 仅 0.099 ms/token，是 vLLM 的 32 倍、llama.cpp 的 40 倍
 - **Prefill 阶段**：llama.cpp 凭借标准 Attention + 极致优化达到 16,148 tok/s，是 Deploy 的 28 倍；vLLM 与 Deploy 相近（614 vs 574 tok/s）
 - **端到端**：vLLM 通过 CUDA Graph + 流水线重叠（Prefill 末尾与 Decode 首 token 重叠执行），E2E 仅 1.6s，最优；Deploy E2E 1.8s，差距缩小到 15%
-- **显存**：Deploy 占用 8.77 GB / 11.91 GB，较为高效
+- **显存**：Deploy 占用 ~4.0 GB（优化后），通过 Embedding/LM Head 权重共享、BF16 存储、KV Cache 动态分配、统一 cuBLAS Handle 等技术实现 53.6% 内存节省
 
 ### 性能演进
 
@@ -194,6 +194,19 @@
 
 - Decode 阶段启用 CUDA Graph，减少 Kernel Launch 开销
 - 静态图捕获，多次执行零开销
+
+### 7. 内存优化 (v3.3)
+
+| 优化项 | 实现方式 | 节省内存 |
+|--------|---------|---------|
+| **Embedding/LM Head 权重共享** | 两者共享同一份 BF16 权重 | ~297 MB |
+| **LM Head BF16 存储** | 主机端 FP32→BF16 转换，GPU 仅存 BF16 | ~297 MB |
+| **KV Cache 动态分配** | 2x 扩容策略，按需分配 | 短序列优化 |
+| **统一 cuBLAS Handle** | CublasHandlePool 单例池 | ~36 MB |
+
+**总优化效果**: 显存从 ~8.77 GB 降至 ~4.07 GB，**节省 53.6%**
+
+详细分析见 [docs/memory_optimization/memory_analysis_report.md](docs/memory_optimization/memory_analysis_report.md)
 
 ## 快速开始
 

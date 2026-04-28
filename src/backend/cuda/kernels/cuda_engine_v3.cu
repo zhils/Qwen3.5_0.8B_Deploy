@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 namespace qwen {
 namespace cuda {
@@ -17,6 +18,14 @@ static void checkCudaV3(cudaError_t result, const char* file, int line) {
     }
 }
 #define CHECK_CUDA_V3(call) checkCudaV3(call, __FILE__, __LINE__)
+
+__global__ void fp32_to_bf16_kernel(const float* __restrict__ fp32_data,
+                                    __nv_bfloat16* __restrict__ bf16_data, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    bf16_data[i] = __float2bfloat16(fp32_data[i]);
+}
 
 CudaLayerV3::CudaLayerV3(int layer_idx, const CudaLayerConfigV3& config)
     : layer_idx_(layer_idx), config_(config) {
@@ -78,19 +87,19 @@ CudaEngineV3::CudaEngineV3(int num_layers, int hidden_size, int intermediate_siz
     : num_layers_(num_layers), hidden_size_(hidden_size), intermediate_size_(intermediate_size),
       vocab_size_(vocab_size), max_seq_len_(max_seq_len), d_input_buf_(nullptr),
       d_normed_input_(nullptr), d_attn_out_(nullptr), d_post_normed_(nullptr), d_mlp_out_(nullptr),
-      d_residual_(nullptr), d_output_buf_(nullptr), d_lmhead_out_(nullptr), gpu_memory_bytes_(0),
-      ready_(false) {
+      d_residual_(nullptr), d_output_buf_(nullptr), d_lmhead_out_(nullptr),
+      d_shared_embedding_lmhead_weight_(nullptr), gpu_memory_bytes_(0), ready_(false) {
     CudaLayerConfigV3 default_config;
     default_config.hidden_size = hidden_size;
     default_config.intermediate_size = intermediate_size;
 
-    // v3.0: All layers use Flash Attention (Full Attention)
     for (int i = 0; i < num_layers_; ++i) {
         layers_.push_back(std::make_unique<CudaLayerV3>(i, default_config));
     }
 
     final_norm_ = std::make_unique<CudaRMSNorm>(hidden_size);
     lm_head_ = std::make_unique<CudaLMHead>(hidden_size, vocab_size);
+    embedding_ = std::make_unique<CudaTokenEmbedding>(vocab_size, hidden_size);
 
     allocate_buffers();
     ready_ = true;
@@ -98,6 +107,10 @@ CudaEngineV3::CudaEngineV3(int num_layers, int hidden_size, int intermediate_siz
 
 CudaEngineV3::~CudaEngineV3() {
     free_buffers();
+    if (d_shared_embedding_lmhead_weight_) {
+        cudaFree(d_shared_embedding_lmhead_weight_);
+        d_shared_embedding_lmhead_weight_ = nullptr;
+    }
 }
 
 void CudaEngineV3::allocate_buffers() {
@@ -122,7 +135,6 @@ void CudaEngineV3::allocate_buffers() {
     CHECK_CUDA_V3(cudaMalloc(&d_lmhead_out_, static_cast<size_t>(vocab_size_) * sizeof(float)));
     total += static_cast<size_t>(vocab_size_) * sizeof(float);
 
-    // v3.0: All layers use Full Attention, so all need KV cache
     kv_cache_.reset(num_layers_, 2, 256, max_seq_len_);
 
     gpu_memory_bytes_ = total;
@@ -163,7 +175,6 @@ void CudaEngineV3::ensure_batch_intermediate_buffers(int batch_size) const {
     if (d_batch_mlp_out_) cudaFree(d_batch_mlp_out_);
 
     size_t bytes = static_cast<size_t>(batch_size) * hidden_size_ * sizeof(float);
-    // v3.0: All Flash Attention, attn_out needs batch_size * num_heads * kv_head_dim
     int num_heads = 8;
     int kv_head_dim = 256;
     size_t attn_bytes = static_cast<size_t>(batch_size) * num_heads * kv_head_dim * sizeof(float);
@@ -203,7 +214,6 @@ void CudaEngineV3::set_layer_weights(int layer_idx, const std::vector<float>& we
     auto up_w = slice(isz * hs);
     auto down_w = slice(hs * isz);
 
-    // v3.0: Only Full Attention weights (no Linear Attention weights)
     std::vector<float> fq, fk, fv, fqn, fkn, fo;
 
     fq = slice(fnh * qhd * 2 * hs);
@@ -223,6 +233,40 @@ void CudaEngineV3::set_final_norm_weight(const std::vector<float>& weight) {
 
 void CudaEngineV3::set_lm_head_weight(const std::vector<float>& weight) {
     lm_head_->set_weight(weight);
+}
+
+void CudaEngineV3::set_shared_embedding_lmhead_weight(const std::vector<float>& weight) {
+    size_t weight_size = static_cast<size_t>(vocab_size_) * hidden_size_;
+    if (weight.size() != weight_size) {
+        throw std::invalid_argument("set_shared_embedding_lmhead_weight: size mismatch, expected " +
+                                    std::to_string(weight_size) + ", got " +
+                                    std::to_string(weight.size()));
+    }
+
+    if (d_shared_embedding_lmhead_weight_) {
+        cudaFree(d_shared_embedding_lmhead_weight_);
+    }
+
+    CHECK_CUDA_V3(cudaMalloc(&d_shared_embedding_lmhead_weight_, 
+                             weight_size * sizeof(__nv_bfloat16)));
+
+    float* d_temp_fp32 = nullptr;
+    CHECK_CUDA_V3(cudaMalloc(&d_temp_fp32, weight_size * sizeof(float)));
+    CHECK_CUDA_V3(cudaMemcpy(d_temp_fp32, weight.data(), weight_size * sizeof(float),
+                             cudaMemcpyHostToDevice));
+
+    dim3 block(256);
+    dim3 grid((weight_size + 255) / 256);
+    fp32_to_bf16_kernel<<<grid, block>>>(d_temp_fp32, d_shared_embedding_lmhead_weight_, weight_size);
+    CHECK_CUDA_V3(cudaGetLastError());
+    CHECK_CUDA_V3(cudaFree(d_temp_fp32));
+
+    embedding_->set_weight_bf16_ptr(d_shared_embedding_lmhead_weight_);
+    lm_head_->set_weight_bf16_ptr(d_shared_embedding_lmhead_weight_);
+}
+
+void CudaEngineV3::set_embedding_weight(const std::vector<float>& weight) {
+    embedding_->set_weight(weight);
 }
 
 void CudaEngineV3::forward(const float* d_input, float* d_output, int position) {
@@ -275,6 +319,20 @@ void CudaEngineV3::forward_batch_prefill(const float* d_input, float* d_output,
 
     float* final_in = (num_layers_ % 2 == 0) ? ping : pong;
     final_norm_->forward(final_in, d_output, batch_size);
+}
+
+void CudaEngineV3::forward_token(int token_id, float* d_output, int position) {
+    embedding_->forward(token_id, d_input_buf_);
+    forward(d_input_buf_, d_output, position);
+}
+
+void CudaEngineV3::forward_tokens(const std::vector<int>& token_ids, float* d_output, 
+                                   const int* positions) {
+    int batch_size = static_cast<int>(token_ids.size());
+    ensure_batch_buffers(batch_size);
+    
+    embedding_->forward(token_ids, d_batch_input_buf_);
+    forward_batch_prefill(d_batch_input_buf_, d_output, positions, batch_size);
 }
 
 void CudaEngineV3::ensure_batch_buffers(int batch_size) {

@@ -15,13 +15,20 @@ struct CudaKVCache {
     int num_layers;
     int num_kv_heads;
     int head_dim;
-    int max_seq_len;
+    int max_seq_len;      // 当前实际序列长度（动态增长）
+    int capacity_seq_len; // 当前分配的容量
 
-    void reset(int nl, int nkh, int hd, int max_len);
+    void reset(int nl, int nkh, int hd, int init_capacity = 1024);
     void clear();
     int length(int layer_idx) const {
         return layer_lengths[layer_idx];
     }
+
+    // 动态扩容：确保容量至少为 required_seq_len
+    void ensure_capacity(int required_seq_len);
+
+private:
+    void grow(int new_capacity);
 };
 
 class CudaFullAttention {
