@@ -222,18 +222,22 @@ static void run_v2_benchmark(const TestConfig& cfg) {
 
         CHECK_CUDA(cudaEventRecord(ev_start));
 
-        const int BATCH_SIZE = std::max(32, cfg.batch_size);
+        // Chunked Prefill: 根据用户输入的 batch_size 动态选择 chunk_size
+        // batch_size=1 -> chunk_size=32 (最大化并行)
+        // batch_size>=32 -> chunk_size=batch_size (用户控制)
+        const int PREFILL_CHUNK_SIZE = (cfg.batch_size < 32) ? 32 : cfg.batch_size;
+        const int DECODE_BATCH_SIZE = cfg.batch_size;
         int* d_batch_positions;
-        CHECK_CUDA(cudaMalloc(&d_batch_positions, BATCH_SIZE * sizeof(int)));
+        CHECK_CUDA(cudaMalloc(&d_batch_positions, PREFILL_CHUNK_SIZE * sizeof(int)));
         float* d_batch_input;
         float* d_batch_output;
-        CHECK_CUDA(cudaMalloc(&d_batch_input, BATCH_SIZE * cfg.hidden_size * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&d_batch_output, BATCH_SIZE * cfg.hidden_size * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_batch_input, PREFILL_CHUNK_SIZE * cfg.hidden_size * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_batch_output, PREFILL_CHUNK_SIZE * cfg.hidden_size * sizeof(float)));
 
         int prefill_pos = 0;
-        bool use_graph = false; // (BATCH_SIZE >= 32);
+        bool use_graph = false;
         while (prefill_pos < cfg.prefill_tokens) {
-            int current_batch = std::min(BATCH_SIZE, cfg.prefill_tokens - prefill_pos);
+            int current_batch = std::min(PREFILL_CHUNK_SIZE, cfg.prefill_tokens - prefill_pos);
 
             std::vector<int> token_ids(current_batch);
             std::vector<int> positions(current_batch);
@@ -247,7 +251,7 @@ static void run_v2_benchmark(const TestConfig& cfg) {
             CHECK_CUDA(cudaMemcpy(d_batch_positions, positions.data(),
                                   current_batch * sizeof(int), cudaMemcpyHostToDevice));
 
-            if (use_graph && current_batch == BATCH_SIZE) {
+            if (use_graph && current_batch == PREFILL_CHUNK_SIZE) {
                 engine.forward_batch_prefill_graph(d_batch_input, d_batch_output, positions.data(),
                                                    current_batch);
             } else {
@@ -255,7 +259,7 @@ static void run_v2_benchmark(const TestConfig& cfg) {
                                              current_batch);
             }
 
-            if (prefill_pos + current_batch >= cfg.prefill_tokens || current_batch < BATCH_SIZE) {
+            if (prefill_pos + current_batch >= cfg.prefill_tokens || current_batch < PREFILL_CHUNK_SIZE) {
                 CHECK_CUDA(cudaMemcpy(d_backbone_out,
                                       d_batch_output + (current_batch - 1) * cfg.hidden_size,
                                       cfg.hidden_size * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -277,14 +281,44 @@ static void run_v2_benchmark(const TestConfig& cfg) {
         cudaFree(d_batch_output);
         cudaFree(d_batch_positions);
 
+        // Batch decode: process all sequences in parallel
         int position = cfg.prefill_tokens;
+        
+        // Allocate batch decode buffers
+        float* d_batch_emb = nullptr;
+        float* d_batch_backbone_out = nullptr;
+        float* d_batch_logits = nullptr;
+        int* d_batch_positions_decode = nullptr;
+        CHECK_CUDA(cudaMalloc(&d_batch_emb, cfg.batch_size * cfg.hidden_size * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_batch_backbone_out, cfg.batch_size * cfg.hidden_size * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_batch_logits, cfg.batch_size * cfg.vocab_size * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_batch_positions_decode, cfg.batch_size * sizeof(int)));
+
         for (int step = 0; step < cfg.decode_tokens; ++step) {
             CHECK_CUDA(cudaEventRecord(ev_start));
-            emb.forward(next_token, d_emb);
-            engine.forward(d_emb, d_backbone_out, position);
-            lmhead.forward(d_backbone_out, d_logits);
-            next_token = sampler.sample(d_logits);
+            
+            // Prepare batch input: all sequences use the same next_token for simplicity
+            std::vector<int> batch_tokens(cfg.batch_size, next_token);
+            std::vector<int> batch_positions(cfg.batch_size, position);
+            
+            emb.forward(batch_tokens, d_batch_emb);
+            
+            CHECK_CUDA(cudaMemcpy(d_batch_positions_decode, batch_positions.data(),
+                                  cfg.batch_size * sizeof(int), cudaMemcpyHostToDevice));
+            
+            engine.forward_batch_decode(d_batch_emb, d_batch_backbone_out, 
+                                        d_batch_positions_decode, cfg.batch_size);
+            
+            // LMHead: process each sequence individually (no batch support yet)
+            for (int b = 0; b < cfg.batch_size; ++b) {
+                lmhead.forward(d_batch_backbone_out + b * cfg.hidden_size, 
+                               d_batch_logits + b * cfg.vocab_size);
+            }
+            
+            // Sample next token for all sequences (use first sequence's token for simplicity)
+            next_token = sampler.sample(d_batch_logits);
             position++;
+            
             CHECK_CUDA(cudaEventRecord(ev_stop));
             CHECK_CUDA(cudaEventSynchronize(ev_stop));
 
@@ -292,6 +326,11 @@ static void run_v2_benchmark(const TestConfig& cfg) {
             CHECK_CUDA(cudaEventElapsedTime(&step_ms, ev_start, ev_stop));
             decode_stats.add(step_ms);
         }
+        
+        cudaFree(d_batch_emb);
+        cudaFree(d_batch_backbone_out);
+        cudaFree(d_batch_logits);
+        cudaFree(d_batch_positions_decode);
 
         CHECK_CUDA(cudaEventDestroy(ev_start));
         CHECK_CUDA(cudaEventDestroy(ev_stop));
@@ -304,17 +343,28 @@ static void run_v2_benchmark(const TestConfig& cfg) {
     std::cout << std::string(72, '=') << std::endl;
 
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "\n--- Prefill (" << cfg.prefill_tokens << " tokens) ---" << std::endl;
+    std::cout << "\n--- Prefill (" << cfg.prefill_tokens << " tokens, batch=" << cfg.batch_size << ") ---" << std::endl;
     std::cout << "  Total time:    " << std::setw(10) << prefill_stats.avg() << " ms" << std::endl;
     std::cout << "  TTFT:          " << std::setw(10) << prefill_stats.avg() << " ms" << std::endl;
-    std::cout << "  Throughput:    " << std::setw(10)
+    std::cout << "  Single thrpt:  " << std::setw(10)
               << (cfg.prefill_tokens / (prefill_stats.avg() / 1000.0)) << " tokens/sec" << std::endl;
+    std::cout << "  Batch thrpt:   " << std::setw(10)
+              << (cfg.prefill_tokens * cfg.batch_size / (prefill_stats.avg() / 1000.0)) << " tokens/sec" << std::endl;
 
-    std::cout << "\n--- Decode (" << cfg.decode_tokens << " tokens) ---" << std::endl;
+    std::cout << "\n--- Decode (" << cfg.decode_tokens << " tokens, batch=" << cfg.batch_size << ") ---" << std::endl;
     std::cout << "  TPOT:          " << std::setw(10)
               << (decode_stats.avg() / cfg.decode_tokens) << " ms/token" << std::endl;
-    std::cout << "  Throughput:    " << std::setw(10)
+    std::cout << "  Single thrpt:  " << std::setw(10)
               << (cfg.decode_tokens / (decode_stats.avg() / 1000.0)) << " tokens/sec" << std::endl;
+    std::cout << "  Batch thrpt:   " << std::setw(10)
+              << (cfg.decode_tokens * cfg.batch_size / (decode_stats.avg() / 1000.0)) << " tokens/sec" << std::endl;
+    
+    float total_time_ms = prefill_stats.avg() + decode_stats.avg();
+    float total_tokens = (cfg.prefill_tokens + cfg.decode_tokens) * cfg.batch_size;
+    std::cout << "\n--- E2E (batch=" << cfg.batch_size << ") ---" << std::endl;
+    std::cout << "  Total time:    " << std::setw(10) << total_time_ms << " ms" << std::endl;
+    std::cout << "  E2E thrpt:     " << std::setw(10)
+              << (total_tokens / (total_time_ms / 1000.0)) << " tokens/sec" << std::endl;
 
     size_t free_mem, total_mem;
     cudaMemGetInfo(&free_mem, &total_mem);

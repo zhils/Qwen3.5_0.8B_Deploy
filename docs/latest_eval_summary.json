@@ -1,0 +1,26 @@
+﻿{
+    "generated_at":  "2026-04-29 22:21:17",
+    "env":  {
+                "prefill_tokens":  128,
+                "decode_tokens":  32,
+                "rounds":  1,
+                "batch_size":  1,
+                "build_config":  "Release",
+                "use_wsl":  true
+            },
+    "accuracy":  {
+                     "verify_linear_attn_batch_pass":  true,
+                     "verify_linear_attn_batch_max_diff":  2.94917E-08,
+                     "verify_linear_attn_batch_avg_diff":  2.47039E-09,
+                     "v2_kernel_accuracy_validate_pass":  false
+                 },
+    "performance":  {
+                        "ttft_ms":  316.308,
+                        "prefill_tps":  404.669,
+                        "tpot_ms":  0.808,
+                        "decode_tps":  1237.477,
+                        "e2e_tps":  467.608,
+                        "vram_used_mb":  5212.562
+                    },
+    "gate_pass":  false
+}

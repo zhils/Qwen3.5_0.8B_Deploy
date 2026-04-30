@@ -1,0 +1,66 @@
+[
+    {
+        "id": 1,
+        "category": "factual_contradiction",
+        "prompt": "What is the capital of France?",
+        "response": "The capital of France is Paris.",
+        "expected_hallucination": false,
+        "description": "Correct factual answer"
+    },
+    {
+        "id": 2,
+        "category": "factual_contradiction",
+        "prompt": "The capital of France is Paris. What is the capital of France?",
+        "response": "The capital of France is Berlin.",
+        "expected_hallucination": true,
+        "description": "Direct contradiction of given fact"
+    },
+    {
+        "id": 3,
+        "category": "numeric_inconsistency",
+        "prompt": "What is 2 + 2?",
+        "response": "2 + 2 = 5",
+        "expected_hallucination": true,
+        "description": "Mathematical error"
+    },
+    {
+        "id": 4,
+        "category": "repetition",
+        "prompt": "Tell me a short story.",
+        "response": "Once upon a time there was a cat. The cat was a cat. The cat was a cat. The cat was a cat. The cat was a cat.",
+        "expected_hallucination": true,
+        "description": "Excessive repetition"
+    },
+    {
+        "id": 5,
+        "category": "self_contradiction",
+        "prompt": "What is the capital of Japan?",
+        "response": "The capital of Japan is Tokyo. Tokyo is also the capital of China.",
+        "expected_hallucination": true,
+        "description": "Self-contradiction about capitals"
+    },
+    {
+        "id": 6,
+        "category": "entity_fabrication",
+        "prompt": "Tell me about Python.",
+        "response": "Python is a type of snake that lives in Australia.",
+        "expected_hallucination": true,
+        "description": "Entity fabrication (Python programming language vs snake)"
+    },
+    {
+        "id": 7,
+        "category": "temporal_inconsistency",
+        "prompt": "What year did World War II end?",
+        "response": "World War II ended in 1945. The war began in 1980.",
+        "expected_hallucination": true,
+        "description": "Temporal inconsistency"
+    },
+    {
+        "id": 8,
+        "category": "unsupported_inference",
+        "prompt": "What is the capital of France?",
+        "response": "The capital of France is Paris. Paris is also the capital of Germany.",
+        "expected_hallucination": true,
+        "description": "Unsupported inference"
+    }
+]

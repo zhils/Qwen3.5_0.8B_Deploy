@@ -1,0 +1,31 @@
+# Qwen3.5-0.8B Hallucination Harness Knowledge Base
+# Format: One fact per line, lines starting with # are comments
+#
+# This file contains verified facts for factual contradiction detection.
+# Add your domain-specific knowledge here.
+
+# Example: Scientific facts
+water boils at 100 celsius
+water freezes at 0 celsius
+earth is round
+sun is a star
+
+# Example: Geographic facts
+paris is the capital of france
+tokyo is the capital of japan
+beijing is the capital of china
+washington dc is the capital of the united states
+
+# Example: Historical facts
+world war 2 ended in 1945
+world war 2 began in 1939
+the moon landing was in 1969
+
+# Example: Mathematical facts
+2 + 2 = 4
+pi is approximately 3.14159
+e is approximately 2.71828
+
+# Example: Qwen model facts
+qwen is a large language model developed by alibaba
+qwen3.5-0.8b has 800 million parameters

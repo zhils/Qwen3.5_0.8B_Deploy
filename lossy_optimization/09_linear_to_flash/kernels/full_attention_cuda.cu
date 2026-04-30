@@ -1,7 +1,7 @@
 #include "full_attention_cuda.hpp"
 #include "flash_attention.cuh"
 #include "fused_kernels.cuh"
-#include "cublas_handle_pool.hpp"
+#include "cutlass_gemm_wrapper.cuh"
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
@@ -14,15 +14,6 @@
             printf("FA Kernel Error: %s\n", cudaGetErrorString(_err));                             \
         }                                                                                          \
     }
-
-#define FA_CUBLAS_CHECK(call)                                                                      \
-    do {                                                                                           \
-        cublasStatus_t _err = (call);                                                              \
-        if (_err != CUBLAS_STATUS_SUCCESS) {                                                       \
-            fprintf(stderr, "cuBLAS error %d at %s:%d\n", static_cast<int>(_err), __FILE__, __LINE__); \
-            exit(1);                                                                               \
-        }                                                                                          \
-    } while (0)
 
 namespace qwen {
 namespace cuda {
@@ -139,17 +130,127 @@ __global__ void gate_sigmoid_kernel(float* __restrict__ d_attn_out,
     d_attn_out[h * kv_head_dim + d] *= 1.0f / (1.0f + expf(-g));
 }
 
-__global__ void output_proj_kernel(const float* __restrict__ attn_out, float* __restrict__ output,
-                                   const float* __restrict__ weight, int total_out,
-                                   int hidden_size) {
+// Optimized output projection using shared memory tiling
+template <int TILE_M, int TILE_K, int THREADS>
+__global__ void output_proj_kernel_optimized(const float* __restrict__ attn_out,
+                                             float* __restrict__ output,
+                                             const float* __restrict__ weight, int total_out,
+                                             int hidden_size) {
+    __shared__ float s_attn[TILE_K];
+    __shared__ float s_weight[TILE_M][TILE_K + 1];
+
+    const int row_base = blockIdx.x * TILE_M;
+    const int tid = threadIdx.x;
+
+    const int rows_per_thread = (TILE_M + THREADS - 1) / THREADS;
+    const int my_row_start = tid * rows_per_thread;
+    const int my_row_end = min(my_row_start + rows_per_thread, TILE_M);
+
+    float accum[8] = {0.0f};
+
+    for (int k_tile = 0; k_tile < total_out; k_tile += TILE_K) {
+        int k_end = min(k_tile + TILE_K, total_out);
+        int k_len = k_end - k_tile;
+
+        for (int k = tid; k < k_len; k += THREADS) {
+            s_attn[k] = attn_out[k_tile + k];
+        }
+
+        for (int r = my_row_start; r < my_row_end; ++r) {
+            int global_row = row_base + r;
+            if (global_row < hidden_size) {
+                const float* w_row = weight + global_row * total_out + k_tile;
+                for (int k = 0; k < k_len; ++k) {
+                    s_weight[r][k] = w_row[k];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        for (int r = my_row_start; r < my_row_end; ++r) {
+            int global_row = row_base + r;
+            if (global_row < hidden_size) {
+                float sum = accum[r - my_row_start];
+                #pragma unroll 4
+                for (int k = 0; k < k_len; ++k) {
+                    sum += s_weight[r][k] * s_attn[k];
+                }
+                accum[r - my_row_start] = sum;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for (int r = my_row_start; r < my_row_end; ++r) {
+        int global_row = row_base + r;
+        if (global_row < hidden_size) {
+            output[global_row] = accum[r - my_row_start];
+        }
+    }
+}
+
+// Simple fallback
+__global__ void output_proj_kernel_simple(const float* __restrict__ attn_out,
+                                          float* __restrict__ output,
+                                          const float* __restrict__ weight, int total_out,
+                                          int hidden_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= hidden_size)
-        return;
+    if (idx >= hidden_size) return;
     float sum = 0.0f;
+    #pragma unroll 4
     for (int j = 0; j < total_out; ++j) {
         sum += weight[idx * total_out + j] * attn_out[j];
     }
     output[idx] = sum;
+}
+
+static void launch_output_proj(const float* attn_out, float* output, const float* weight,
+                               int total_out, int hidden_size, cudaStream_t stream = 0) {
+    if (hidden_size < 128 || total_out < 128) {
+        int block = 256;
+        int grid = (hidden_size + block - 1) / block;
+        output_proj_kernel_simple<<<grid, block, 0, stream>>>(attn_out, output, weight, total_out, hidden_size);
+        return;
+    }
+
+    // Use CUTLASS-style warp-level GEMV
+    bool aligned = ((uintptr_t)weight % 16 == 0) &&
+                   ((uintptr_t)attn_out % 16 == 0) &&
+                   (total_out % 4 == 0);
+
+    if (aligned) {
+        launch_cutlass_gemv(weight, attn_out, output, hidden_size, total_out, stream);
+    } else {
+        // Fallback to shared memory tiling
+        const int TILE_M = 32;
+        const int TILE_K = 256;
+        const int THREADS = 256;
+        int grid = (hidden_size + TILE_M - 1) / TILE_M;
+        output_proj_kernel_optimized<TILE_M, TILE_K, THREADS>
+            <<<grid, THREADS, 0, stream>>>(attn_out, output, weight, total_out, hidden_size);
+    }
+}
+
+// Keep old name for backward compatibility - device function wrapper
+__device__ void output_proj_kernel_device(const float* __restrict__ attn_out, float* __restrict__ output,
+                                   const float* __restrict__ weight, int total_out,
+                                   int hidden_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_size) return;
+    float sum = 0.0f;
+    #pragma unroll 4
+    for (int j = 0; j < total_out; ++j) {
+        sum += weight[idx * total_out + j] * attn_out[j];
+    }
+    output[idx] = sum;
+}
+
+__global__ void output_proj_kernel(const float* __restrict__ attn_out, float* __restrict__ output,
+                                   const float* __restrict__ weight, int total_out,
+                                   int hidden_size) {
+    output_proj_kernel_device(attn_out, output, weight, total_out, hidden_size);
 }
 
 CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_heads,
@@ -363,10 +464,7 @@ void CudaFullAttention::forward(const float* input, float* output, CudaKVCache& 
                                                       q_head_dim_);
     FA_CUDA_CHECK();
 
-    dim3 block_proj(256);
-    dim3 grid_proj((hidden_size_ + 255) / 256);
-    output_proj_kernel<<<grid_proj, block_proj>>>(d_attn_out, output, d_o_proj_weight_, total_out,
-                                                  hidden_size_);
+    launch_output_proj(d_attn_out, output, d_o_proj_weight_, total_out, hidden_size_);
     FA_CUDA_CHECK();
 }
 
@@ -616,13 +714,13 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
         d_batch_attn_out_buf_, d_batch_gate_buf_, num_heads_, kv_head_dim_, q_head_dim_, batch_size);
     FA_CUDA_CHECK();
 
-    cublasHandle_t handle = CublasHandlePool::instance().get();
-    const float alpha = 1.0f, beta = 0.0f;
-    FA_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                hidden_size_, batch_size, total_out,
-                                &alpha, d_o_proj_weight_, total_out,
-                                d_batch_attn_out_buf_, total_out,
-                                &beta, output, hidden_size_));
+    for (int b = 0; b < batch_size; ++b) {
+        launch_output_proj(
+            d_batch_attn_out_buf_ + b * total_out,
+            output + b * hidden_size_,
+            d_o_proj_weight_, total_out, hidden_size_);
+    }
+    FA_CUDA_CHECK();
 }
 
 } // namespace cuda

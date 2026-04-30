@@ -1,22 +1,24 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
 #include <cublas_v2.h>
 #include <vector>
+#include <cstdint>
 
 namespace qwen {
 namespace cuda {
 
 struct CudaKVCache {
-    float* d_k_cache;
-    float* d_v_cache;
+    int8_t* d_k_cache;
+    int8_t* d_v_cache;
+    float* d_k_scale;
+    float* d_v_scale;
     std::vector<int> layer_lengths;
     int num_layers;
     int num_kv_heads;
     int head_dim;
-    int max_seq_len;      // 当前实际序列长度（动态增长）
-    int capacity_seq_len; // 当前分配的容量
+    int max_seq_len;
+    int capacity_seq_len;
 
     void reset(int nl, int nkh, int hd, int init_capacity = 1024);
     void clear();
@@ -24,7 +26,6 @@ struct CudaKVCache {
         return layer_lengths[layer_idx];
     }
 
-    // 动态扩容：确保容量至少为 required_seq_len
     void ensure_capacity(int required_seq_len);
 
 private:
@@ -45,13 +46,6 @@ class CudaFullAttention {
     void forward(const float* input, float* output, CudaKVCache& kv_cache, int layer_idx,
                  int position) const;
 
-    /**
-     * Batch prefill forward: processes multiple tokens simultaneously.
-     * input:  [batch_size, hidden_size] contiguous
-     * output: [batch_size, hidden_size] contiguous
-     * positions: [batch_size] positions for RoPE
-     * max_seq: precomputed max sequence length (avoids D2H memcpy for CUDA Graph)
-     */
     void forward_batch_prefill(const float* input, float* output, CudaKVCache& kv_cache,
                                int layer_idx, const int* positions, int batch_size,
                                int max_seq = 0) const;
@@ -85,7 +79,6 @@ class CudaFullAttention {
     mutable float* d_attn_scores_buf_;
     mutable int max_seq_len_;
 
-    // Batch prefill buffers (lazily allocated)
     mutable float* d_batch_q_buf_;
     mutable float* d_batch_gate_buf_;
     mutable float* d_batch_k_buf_;

@@ -11,6 +11,7 @@
 #include "lm_head_cuda.hpp"
 #include "token_embedding_cuda.hpp"
 #include "full_attention_cuda.hpp"
+#include "linear_attention_cuda.hpp"
 
 namespace qwen {
 namespace cuda {
@@ -23,11 +24,16 @@ struct CudaLayerConfigV3 {
     int num_kv_heads = 2;
     int q_head_dim = 256;
     int kv_head_dim = 256;
+
+    int linear_num_heads = 16;
+    int linear_key_dim = 128;
+    int linear_value_dim = 128;
+    int linear_conv_kernel = 4;
 };
 
 class CudaLayerV3 {
   public:
-    CudaLayerV3(int layer_idx, const CudaLayerConfigV3& config);
+    CudaLayerV3(int layer_idx, const CudaLayerConfigV3& config, bool use_full_attention = true);
     ~CudaLayerV3();
 
     void set_weights(const std::vector<float>& input_norm_weight,
@@ -38,24 +44,38 @@ class CudaLayerV3 {
                      const std::vector<float>& full_v_w, const std::vector<float>& full_qn_w,
                      const std::vector<float>& full_kn_w, const std::vector<float>& full_o_w);
 
+    void set_linear_attention_weights(
+        const std::vector<float>& in_proj_qkv_weight,
+        const std::vector<float>& in_proj_a_weight,
+        const std::vector<float>& in_proj_b_weight,
+        const std::vector<float>& in_proj_z_weight,
+        const std::vector<float>& conv1d_weight,
+        const std::vector<float>& out_proj_weight,
+        const std::vector<float>& a_log = {},
+        const std::vector<float>& dt_bias = {},
+        const std::vector<float>& norm_weight = {});
+
     void forward(const float* d_input, float* d_output, float* d_normed_input_buf,
                  float* d_attn_out_buf, float* d_post_normed_buf, float* d_mlp_out_buf,
-                 CudaKVCache& kv_cache, int position) const;
+                 CudaKVCache& kv_cache, CudaLinearAttnState& linear_state, int position) const;
 
     void forward_batch_prefill(const float* d_input, float* d_output, float* d_normed_input_buf,
                                float* d_attn_out_buf, float* d_post_normed_buf, float* d_mlp_out_buf,
                                CudaKVCache& kv_cache, const int* positions, int batch_size) const;
 
+    bool is_full_attention() const { return use_full_attention_; }
     int layer_idx() const { return layer_idx_; }
 
   private:
     int layer_idx_;
     CudaLayerConfigV3 config_;
+    bool use_full_attention_;
 
     std::unique_ptr<CudaRMSNorm> input_norm_;
     std::unique_ptr<CudaRMSNorm> post_norm_;
     std::unique_ptr<CudaMLP> mlp_;
     std::unique_ptr<CudaFullAttention> full_attn_;
+    std::unique_ptr<CudaLinearAttention> linear_attn_;
 };
 
 class CudaEngineV3 {
@@ -67,19 +87,21 @@ class CudaEngineV3 {
     void set_layer_weights(int layer_idx, const std::vector<float>& weights_flat);
     void set_final_norm_weight(const std::vector<float>& weight);
     void set_lm_head_weight(const std::vector<float>& weight);
-    
+
     void set_shared_embedding_lmhead_weight(const std::vector<float>& weight);
-    
+
     void set_embedding_weight(const std::vector<float>& weight);
 
     void forward(const float* d_input, float* d_output, int position);
 
     void forward_batch_prefill(const float* d_input, float* d_output, const int* positions,
                                int batch_size);
-    
+
     void forward_token(int token_id, float* d_output, int position);
-    
+
     void forward_tokens(const std::vector<int>& token_ids, float* d_output, const int* positions);
+
+    void forward_batch_decode(const std::vector<int>& token_ids, float* d_output, int start_position);
 
     void forward_host(const std::vector<float>& input, std::vector<float>& output, int position);
 
@@ -91,7 +113,7 @@ class CudaEngineV3 {
 
     size_t gpu_memory_bytes() const { return gpu_memory_bytes_; }
     bool ready() const { return ready_; }
-    
+
     CudaTokenEmbedding* embedding() { return embedding_.get(); }
 
   private:
@@ -109,7 +131,8 @@ class CudaEngineV3 {
     std::unique_ptr<CudaTokenEmbedding> embedding_;
 
     CudaKVCache kv_cache_;
-    
+    std::vector<CudaLinearAttnState> linear_states_;
+
     __nv_bfloat16* d_shared_embedding_lmhead_weight_;
 
     float* d_input_buf_;
@@ -126,7 +149,6 @@ class CudaEngineV3 {
     int* d_positions_buf_ = nullptr;
     int max_batch_size_ = 0;
 
-    // Batch prefill intermediate buffers (lazily allocated)
     mutable float* d_batch_normed_input_ = nullptr;
     mutable float* d_batch_attn_out_ = nullptr;
     mutable float* d_batch_post_normed_ = nullptr;

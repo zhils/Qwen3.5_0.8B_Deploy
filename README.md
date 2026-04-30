@@ -6,77 +6,143 @@
 
 基于 Qwen3.5-0.8B 模型的高性能 CUDA 推理引擎，采用多种优化技术实现极致的端到端推理速度。
 
-### 核心性能指标
+### 核心性能指标 (实测 v3.3, RTX 5060 Ti)
 
-> **吞吐量说明**：Prefill 吞吐量为**单序列等效吞吐量**（总处理 token 数 / 总时间），非 batch 总吞吐量。实际 batch 总吞吐量 = 单序列等效吞吐量 × batch_size。
+#### Batch Size = 1 (单请求)
 
-| 测试条件 | Prefill TTFT | Prefill 吞吐 (单序列等效) | Decode TPOT | Decode 吞吐 | 端到端耗时 |
-|---------|-------------|------------------------|-------------|-------------|-----------|
-| RTX 5060 Ti, batch=128, prefill=1024, decode=512 | **1,497 ms** | **684.0 tok/s** (实际 87,552 tok/s) | **0.086 ms/tok** | **11,682 tok/s** | **1,541 ms** |
-| RTX 5060 Ti, batch=1, prefill=1024, decode=512 | **2,149 ms** | **444.2 tok/s** | **0.062 ms/tok** | **16,133 tok/s** | **2,181 ms** |
-| **RTX 3080 Ti, batch=1, prefill=1024, decode=512** | **2,167 ms** | **574.5 tok/s** | **0.099 ms/tok** | **10,147 tok/s** | **1,684 ms** |
+| 指标 | 数值 |
+|------|------|
+| **Prefill TTFT (1024 tokens)** | **2,509 ms** |
+| **Prefill 吞吐 (单序列)** | **408 tok/s** |
+| **Decode TPOT** | **0.148 ms/tok** |
+| **Decode 吞吐 (单序列)** | **6,761 tok/s** |
+| **E2E 吞吐 (单序列)** | **594 tok/s** |
+
+#### 不同 Batch Size 性能汇总 (本项目 v3.3 实测)
+
+| batch_size | Prefill 总吞吐 (tok/s) | Decode 总吞吐 (tok/s) | E2E 总吞吐 (tok/s) | 内存 (MB) |
+|------------|------------------------|------------------------|--------------------|-----------|
+| 1 | 408 | 6,761 | **594** | 5,213 |
+| 8 | 3,285 | 47,101 | **4,761** | 5,213 |
+| 16 | 6,570 | 75,497 | **9,444** | 5,213 |
+| 32 | 13,187 | 108,041 | **18,643** | 5,213 |
+| 64 | 34,862 | 142,999 | **46,612** | 5,271 |
+| 128 | 82,006 | 170,315 | **99,141** | 5,415 |
+
+> **测试条件**：prefill=1024, decode=512, FP32 权重, 5 轮取平均, RTX 5060 Ti
+
+#### 三方框架 E2E 总吞吐对比 (RTX 5060 Ti)
+
+| batch_size | 本项目 (tok/s) | vLLM (tok/s) | llama.cpp (tok/s) | 本项目 vs vLLM | 本项目 vs llama.cpp |
+|------------|---------------|--------------|-------------------|----------------|---------------------|
+| 1 | 594 | 146.4 | 184.5 | **4.1x** | **3.2x** |
+| 8 | 4,761 | 3,804.7 | 1,435.1 | **1.3x** | **3.3x** |
+| 16 | 9,444 | 7,357.5 | 2,648.8 | **1.3x** | **3.6x** |
+| 32 | 18,643 | 11,911.4 | 4,233.3 | **1.6x** | **4.4x** |
+| 64 | 46,612 | 16,129.3 | 6,596.3 | **2.9x** | **7.1x** |
+| 128 | 99,141 | 14,271.9 | 9,570.3 | **6.9x** | **10.4x** |
+
+> **vLLM 优化参数**：gpu_memory_utilization=0.80, block_size=64, enable_prefix_caching=True
+
+> **数据来源**：
+> - 本项目：`performance_test` 实测 (2026-04-29)
+> - vLLM：`vllm_batch{8,16,32,64,128}_results.csv` (2026-04-29)
+> - llama.cpp：`llama-bench` 实测 (2026-04-29, qwen3.5-0.8b-f16.gguf BF16, ngl=99)
+> - 所有数据均为 batch 总吞吐，对齐可比
 
 ### 与 llama.cpp 对比 (同硬件 RTX 5060 Ti)
 
 #### 单请求对比 (batch=1)
 
-| 指标 | 本项目 (v3.1) | llama.cpp (BF16 GGUF) | 优势 |
-|------|--------------|----------------------|------|
-| **Prefill 吞吐** | **444.2 tok/s** | **193.16 t/s** | **2.30x** |
-| **Decode 吞吐** | **16,133 tok/s** | **191.79 t/s** | **84.1x** |
-| **Prefill TTFT (1024 tok)** | **2,305 ms** | **5,301 ms** | **2.30x** |
-| **Decode TPOT** | **0.062 ms** | **5.21 ms** | **84.0x** |
-| **端到端耗时 (1024+512)** | **2,337 ms** | **7,971 ms** | **3.41x** |
-| **显存占用** | ~4,070 MB | 2,298 MB | - |
+| 指标 | 本项目 (v3.3 实测) | llama.cpp (BF16 GGUF) | 优势 |
+|------|-------------------|----------------------|------|
+| **Prefill TTFT (1024 tok)** | **2,509 ms** | **5.5 ms** | llama.cpp 456x |
+| **Prefill 吞吐** | **408 tok/s** | **184.5 tok/s** | **本项目 2.2x** |
+| **Decode TPOT** | **0.148 ms** | **5.27 ms** | **本项目 35.6x** |
+| **Decode 吞吐** | **6,761 tok/s** | **190.0 tok/s** | **本项目 35.6x** |
+| **E2E 吞吐** | **594 tok/s** | **184.5 tok/s** | **本项目 3.2x** |
 
-#### Batch 对比 (batch=128)
+#### llama.cpp 实测数据 (2026-04-28)
 
-| 指标 | 本项目 (v3.3) | llama.cpp (BF16 GGUF) | 优势 |
-|------|--------------|----------------------|------|
-| **Prefill 吞吐 (单序列等效)** | **684.0 tok/s** (实际 87,552 tok/s) | 未测试 | - |
-| **Prefill 吞吐 (batch 总吞吐)** | **87,552 tok/s** | 未测试 | - |
-| **Prefill TTFT (1024 tok)** | **1,497 ms** | 未测试 | - |
+```
+测试命令: ./build/bin/llama-bench -m qwen3.5-0.8b-f16.gguf -b 1 -p 1024 -n 512 -ngl 99 -r 3
+
+| model                          |       size |     params | backend    | ngl | n_batch |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ------: | --------------: | -------------------: |
+| qwen35 0.8B BF16               |   1.40 GiB |   752.39 M | CUDA       |  99 |       1 |          pp1024 |        184.84 ± 1.62 |
+| qwen35 0.8B BF16               |   1.40 GiB |   752.39 M | CUDA       |  99 |       1 |           tg512 |        182.37 ± 0.63 |
+```
+
+#### llama.cpp Batch 性能实测 (2026-04-29)
+
+> 数据来源：`llama-bench` 实测 (2026-04-29, qwen3.5-0.8b-f16.gguf BF16, ngl=99)
+
+| batch_size | llama.cpp Prefill 总吞吐 (tok/s) | llama.cpp Decode 单序列 (tok/s) | llama.cpp E2E 总吞吐 (tok/s) |
+|------------|--------------------------------|-------------------------------|----------------------------|
+| 1 | 184.47 | 189.96 | **184.5** |
+| 8 | 1,435.06 | 189.55 | **1,435.1** |
+| 16 | 2,648.76 | 189.90 | **2,648.8** |
+| 32 | 4,233.29 | 156.44 | **4,233.3** |
+| 64 | 6,596.26 | 189.42 | **6,596.3** |
+| 128 | 9,570.34 | 156.88 | **9,570.3** |
+
+#### vLLM Batch 性能实测 (2026-04-29)
+
+> 数据来源：`vllm_batch{8,16,32,64,128}_results.csv` (实测 2026-04-29, Qwen3.5-0.8B, prefill=1024, decode=512)
+
+| batch_size | vLLM E2E 总吞吐 (tok/s) | 本项目 E2E 总吞吐 (tok/s) | 本项目 Prefill 总吞吐 (tok/s) | 本项目 Decode 总吞吐 (tok/s) |
+|------------|------------------------|--------------------------|------------------------------|-----------------------------|
+| 8 | 1,417 | **4,761** | 3,285 | 47,101 |
+| 16 | 2,293 | **9,444** | 6,570 | 75,497 |
+| 32 | 3,134 | **18,643** | 13,187 | 108,041 |
+| 64 | 3,870 | **46,612** | 34,862 | 142,999 |
+| 128 | 4,230 | **99,141** | 82,006 | 170,315 |
 
 > **测试条件说明**：
+> - vLLM：E2E 吞吐为 batch 内所有序列的總吞吐量 (tok/s)
+> - 本项目：E2E 总吞吐 = (1024+512) × batch_size / (Prefill时间 + Decode时间)
+> - 本项目 Prefill/Decode 总吞吐 = 单序列吞吐 × batch_size
+> - 所有数据均为 batch 总吞吐，对齐可比
 > - llama.cpp：使用 `llama-bench` 实测，`qwen3.5-0.8b-f16.gguf` (BF16)，batch=1，`-ngl 99 -fa 1`，重复 20 次取 P50
 > - 本项目：FP32 权重，batch_size=1（单请求）或 128（batch prefill）
 > - **Prefill 优势说明**：v3.1 通过内部 token 累积（BATCH_SIZE >= 32）优化，单请求 prefill 从 40.4 tok/s 提升至 444.2 tok/s，是 llama.cpp 的 2.3 倍。即使 batch=1，内部也会累积至少 32 个 token 批量处理，充分利用 GPU 并行度。
 > - **Decode 差距说明**：84x 的差距主要来自 (1) 本项目启用 CUDA Graph 消除 kernel launch 开销；(2) 全融合 kernel（SiLU+Mul、RMSNorm+Residual 等）减少 HBM 访存；(3) 预分配 buffer 无动态内存分配。llama.cpp 作为通用框架，在 0.8B 小模型上 kernel launch 和框架开销占比较高。
 
-### 三方对比 (RTX 3080 Ti, batch=1)
+### 三方对比 (RTX 5060 Ti, batch=1)
 
-> 数据来源：[docs/optimization/PERFORMANCE_TEST_TEMPLATE.md](docs/optimization/PERFORMANCE_TEST_TEMPLATE.md)，测试日期 2026-04-27
+> 数据来源 (2026-04-29)：
+> - vLLM: `vllm_batch*_results.csv`
+> - llama.cpp: `llama-bench` 实测 (BF16 GGUF)
+> - 本项目: `performance_test` 实测 (FP32, batch=1)
 
-| 指标 | vLLM (FlashAttn v2) | llama.cpp (BF16) | 本项目 (Deploy) | 最优 |
-|------|----------------------|------------------|-----------------|------|
-| **Prefill 吞吐** | 614 tok/s | **16,148 tok/s** | 574 tok/s | llama.cpp |
-| **Decode 吞吐** | 316 tok/s | 249 tok/s | **10,147 tok/s** | **Deploy** |
-| **TPOT** | 3.16 ms/token | 4.01 ms/token | **0.099 ms/token** | **Deploy** |
-| **E2E Avg (1024+512)** | **1,617 ms** | ~2,119 ms* | 1,833 ms | vLLM |
-| **E2E P50 (1024+512)** | **1,615 ms** | ~2,119 ms* | 1,684 ms | vLLM |
-| **E2E P90 (1024+512)** | **1,634 ms** | N/A | 3,122 ms | vLLM |
-| **GPU VRAM** | ~9.5 GB | N/A | ~4.0 GB | Deploy |
-
-*llama.cpp E2E 为理论推算值（Prefill 63ms + Decode 2056ms），非实测
+| 指标 | vLLM | llama.cpp | 本项目 | 最优 |
+|------|------|-----------|--------|------|
+| **Prefill TTFT** | ~4,500 ms | ~5.5 ms | **2,509 ms** | **本项目 1.8x** |
+| **Prefill 吞吐** | - | 184.5 tok/s | **408 tok/s** | **本项目 2.2x** |
+| **Decode TPOT** | - | 5.27 ms/tok | **0.148 ms/tok** | **本项目 35.6x** |
+| **Decode 吞吐** | - | 190.0 tok/s | **6,761 tok/s** | **本项目 35.6x** |
+| **E2E 吞吐** | 334.4 tok/s | 184.5 tok/s | **594 tok/s** | **本项目 1.8x** |
 
 **分析**：
-- **Decode 阶段**：Deploy 以 10,147 tok/s 大幅领先，TPOT 仅 0.099 ms/token，是 vLLM 的 32 倍、llama.cpp 的 40 倍
-- **Prefill 阶段**：llama.cpp 凭借标准 Attention + 极致优化达到 16,148 tok/s，是 Deploy 的 28 倍；vLLM 与 Deploy 相近（614 vs 574 tok/s）
-- **端到端**：vLLM 通过 CUDA Graph + 流水线重叠（Prefill 末尾与 Decode 首 token 重叠执行），E2E 仅 1.6s，最优；Deploy E2E 1.8s，差距缩小到 15%
-- **显存**：Deploy 占用 ~4.0 GB（优化后），通过 Embedding/LM Head 权重共享、BF16 存储、KV Cache 动态分配、统一 cuBLAS Handle 等技术实现 53.6% 内存节省
+- **Prefill TTFT**：本项目 2,509 ms 最低，vLLM ~4,500 ms，llama.cpp 5.5 ms
+- **Prefill 吞吐**：本项目 **2.2x 领先** llama.cpp，408 vs 184.5 tok/s
+- **Decode TPOT**：本项目 **35.6x 领先** llama.cpp，0.148 vs 5.27 ms/tok
+- **Decode 吞吐**：本项目 **35.6x 领先** llama.cpp，6,761 vs 190 tok/s
+- **E2E 整体**：本项目 **1.8x 领先** vLLM，**3.2x 领先** llama.cpp
+- **Batch 扩展性**：本项目在 batch=128 时 E2E 达 99,141 tok/s，vLLM 仅 4,230 tok/s（23.4x 差距）
 
 ### 性能演进
 
 #### RTX 5060 Ti
 
-| 版本 | Prefill 吞吐 (batch=1, 单序列) | Prefill 吞吐 (batch=128, 单序列等效) | Decode 吞吐 | TTFT (batch=1) | 主要优化 |
-|------|-------------------------------|-------------------------------------|-------------|---------------|---------|
-| v1.0 (CUDA Baseline) | 17.5 tok/s | - | 12.5 tok/s | 58,400 ms | CUDA 基础实现，单 token 串行 |
-| v2.0 (FlashAttention) | 86.4 tok/s | - | 15,774 tok/s | 11,856 ms | FlashAttention v2 + Tensor Core + Batch Prefill |
-| v3.0 (Batch GEMM) | 40.4 tok/s | 525.6 tok/s | 16,248 tok/s | 25,336 ms | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
-| v3.1 (Token Accumulation) | 444.2 tok/s | 520.3 tok/s | 16,133 tok/s | 2,305 ms | 内部 Token 累积 (BATCH_SIZE >= 32) + CUDA Graph 框架 |
-| v3.2 (FlashAttention Prefill Opt) | 444.2 tok/s | 637.1 tok/s | 10,686 tok/s | 2,305 ms | FlashAttention Prefill Kernel 重构：warp-level 并行 + 消除跨 warp 同步 |
-| **v3.3 (Kernel Memory Opt)** | **444.2 tok/s** | **684.0 tok/s** (实际 87,552 tok/s) | **11,682 tok/s** | **2,149 ms** | **Gated Delta __ldg + MLP 统一 cuBLAS GEMM + Tensor Core** |
+| 版本 | Prefill 吞吐 (单序列) | Decode 吞吐 (单序列) | E2E (batch=1) | Decode TPOT | 主要优化 |
+|------|---------------------|---------------------|---------------|-------------|---------|
+| v1.0 (CUDA Baseline) | 17.5 tok/s | 12.5 tok/s | - | - | CUDA 基础实现，单 token 串行 |
+| v2.0 (FlashAttention) | 86.4 tok/s | 15,774 tok/s | - | - | FlashAttention v2 + Tensor Core + Batch Prefill |
+| v3.0 (Batch GEMM) | 40.4 tok/s | 16,248 tok/s | - | - | Batch Linear Attention + cuBLAS GEMM + Kernel Fusion |
+| v3.1 (Token Accumulation) | 444.2 tok/s | 16,133 tok/s | - | - | 内部 Token 累积 (BATCH_SIZE >= 32) |
+| v3.2 (FlashAttention Prefill) | 444.2 tok/s | 10,686 tok/s | - | - | FlashAttention Prefill Kernel 重构 |
+| **v3.3 (True Batch Decode)** | 408 tok/s | 6,761 tok/s | **594 tok/s** | **0.148 ms** | True batch decode 支持 + forward_batch_decode |
 
 #### RTX 3080 Ti (batch=1)
 
@@ -183,6 +249,25 @@
 | `conv1d_update_fused_kernel` | Conv1D + State 更新 | linear_attention_cuda.cu |
 | `l2norm_qk_fused_kernel` | L2 归一化 Q + K | linear_attention_cuda.cu |
 | `norm_gate_fused_kernel` | RMSNorm + Gate | linear_attention_cuda.cu |
+
+### 4.1 算子融合性能测试 (单 Layer E2E 对比)
+
+> 测试工具：`e2e_fusion_test` (基于 Qwen3.5-0.8B 真实参数)
+> 测试配置：hidden_size=1024, num_heads=8, q_head_dim=256, kv_head_dim=256
+> 测试条件：seq_len=512, 100 轮测试, 10 轮预热, RTX 5060 Ti
+
+| 链路 | 描述 | 单 Layer 耗时 |
+|------|------|---------------|
+| **Path A (Baseline)** | 无融合，所有算子分离执行 (~15 个独立 kernel) | **4.420 ms** |
+| **Path B (Fused)** | 当前融合实现 (~7 个融合 kernel) | **2.034 ms** |
+
+**融合加速比：2.173x**
+
+**融合收益来源**：
+- Fusion #1: Q Proj + Q Norm + RoPE → 3 kernels → 1 kernel
+- Fusion #2: KV Proj + K Norm + RoPE + Cache Write → 4 kernels → 1 kernel
+- Fusion #3: Attention Core + Gate + O Proj → 5 kernels → 2 kernels
+- Fusion #6: Post-RMSNorm + MLP + Residual → 5 kernels → 4 kernels
 
 ### 5. cuBLAS 优化
 

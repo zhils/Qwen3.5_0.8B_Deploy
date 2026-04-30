@@ -144,7 +144,16 @@ void CudaLayer::forward_batch_prefill(const float* d_input, float* d_output,
     mlp_->forward_add_residual(d_post_normed_buf, d_output, batch_size);
 }
 
-
+void CudaLayer::forward_batch_decode(const float* d_input, float* d_output,
+                                      float* d_normed_input_buf, float* d_attn_out_buf,
+                                      float* d_post_normed_buf, float* d_mlp_out_buf,
+                                      CudaKVCache& kv_cache, CudaLinearAttnState& lin_state,
+                                      const int* positions, int batch_size) const {
+    // Decode batch processing is same as prefill batch for single token per sequence
+    forward_batch_prefill(d_input, d_output, d_normed_input_buf, d_attn_out_buf,
+                          d_post_normed_buf, d_mlp_out_buf, kv_cache, lin_state,
+                          positions, batch_size, 0);
+}
 
 CudaEngine::CudaEngine(int num_layers, int hidden_size, int intermediate_size, int vocab_size,
                        int max_seq_len)
@@ -157,10 +166,10 @@ CudaEngine::CudaEngine(int num_layers, int hidden_size, int intermediate_size, i
     default_config.hidden_size = hidden_size;
     default_config.intermediate_size = intermediate_size;
 
-    // v2.1: Adjust Linear/Full Attention ratio from 75/25 to 50/50
-    // Pattern: Linear, Linear, Full, Full (repeating)
+    // v2.1: All layers use Flash Attention (Linear -> Flash)
+    // Pattern: All Flash
     for (int i = 0; i < num_layers_; ++i) {
-        default_config.is_linear = (i % 4 < 2);
+        default_config.is_linear = false;
         layers_.push_back(std::make_unique<CudaLayer>(i, default_config));
     }
 
@@ -241,8 +250,8 @@ void CudaEngine::set_layer_weights(int layer_idx, const std::vector<float>& weig
     int lnh = 16, lnkh = 2, kd = 128, vd = 128, ck = 4;
     int fnh = 8, qhd = 256, khd = 256;
 
-    // v2.1: 50/50 ratio - Linear, Linear, Full, Full
-    bool is_linear = (layer_idx % 4 < 2);
+    // v2.1: All layers use Flash Attention (Linear -> Flash)
+    bool is_linear = false;
 
     int offset = 0;
     auto slice = [&](int n) -> std::vector<float> {
@@ -313,6 +322,33 @@ void CudaEngine::forward(const float* d_input, float* d_output, int position) {
 
     float* final_in = (num_layers_ % 2 == 0) ? ping : pong;
     final_norm_->forward(final_in, d_output, 1);
+}
+
+void CudaEngine::forward_batch_decode(const float* d_input, float* d_output, const int* positions,
+                                        int batch_size) {
+    // Always use batch path to avoid buffer mismatch
+    ensure_batch_buffers(batch_size);
+
+    CHECK_CUDA(cudaMemcpy(d_batch_input_buf_, d_input,
+                          static_cast<size_t>(batch_size) * hidden_size_ * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(d_positions_buf_, positions, batch_size * sizeof(int),
+                          cudaMemcpyHostToDevice));
+
+    float* ping = d_batch_input_buf_;
+    float* pong = d_batch_output_buf_;
+
+    for (int i = 0; i < num_layers_; ++i) {
+        float* layer_out = (i % 2 == 0) ? pong : ping;
+        float* layer_in = (i % 2 == 0) ? ping : pong;
+
+        layers_[i]->forward_batch_decode(layer_in, layer_out, d_normed_input_, d_attn_out_,
+                                          d_post_normed_, d_mlp_out_, kv_cache_, linear_states_[i],
+                                          d_positions_buf_, batch_size);
+    }
+
+    float* final_in = (num_layers_ % 2 == 0) ? ping : pong;
+    final_norm_->forward(final_in, d_output, batch_size);
 }
 
 void CudaEngine::forward_batch_prefill(const float* d_input, float* d_output, const int* positions,

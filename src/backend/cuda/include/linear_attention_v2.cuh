@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
 #include <vector>
 #include "linear_attention_cuda.hpp"
 

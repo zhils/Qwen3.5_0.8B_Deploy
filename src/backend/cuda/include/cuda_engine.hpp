@@ -58,6 +58,11 @@ class CudaLayer {
                                CudaKVCache& kv_cache, CudaLinearAttnState& lin_state,
                                const int* positions, int batch_size, int max_seq = 0) const;
 
+    void forward_batch_decode(const float* d_input, float* d_output, float* d_normed_input_buf,
+                               float* d_attn_out_buf, float* d_post_normed_buf, float* d_mlp_out_buf,
+                               CudaKVCache& kv_cache, CudaLinearAttnState& lin_state,
+                               const int* positions, int batch_size) const;
+
     int layer_idx() const {
         return layer_idx_;
     }
@@ -94,6 +99,9 @@ class CudaEngine {
 
     void forward_batch_prefill_graph(const float* d_input, float* d_output, const int* positions,
                                      int batch_size);
+
+    void forward_batch_decode(const float* d_input, float* d_output, const int* positions,
+                              int batch_size);
 
     void forward_host(const std::vector<float>& input, std::vector<float>& output, int position);
 

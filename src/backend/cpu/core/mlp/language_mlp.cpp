@@ -1,4 +1,5 @@
 #include "language_mlp.hpp"
+#include <cmath>
 #include <sstream>
 
 namespace qwen {

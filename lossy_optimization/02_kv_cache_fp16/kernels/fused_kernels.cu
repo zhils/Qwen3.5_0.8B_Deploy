@@ -7,6 +7,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cfloat>
 #include <cmath>
 
@@ -364,6 +365,44 @@ void launch_flash_attn_v2_prefill(
     } else {
         launch(flash_attn_v2_prefill_kernel<256, 32>);
     }
+}
+
+__global__ void convert_fp16_to_fp32_batch_kernel(const half* __restrict__ fp16, float* __restrict__ fp32, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) fp32[i] = __half2float(fp16[i]);
+}
+
+void launch_flash_attn_v2_prefill_fp16_cache(
+    const float* Q,
+    const half* K_cache,
+    const half* V_cache,
+    float* output,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int batch_size,
+    int layer_idx,
+    int max_seq_len,
+    float scale,
+    cudaStream_t stream) {
+    
+    size_t cache_size = static_cast<size_t>(max_seq_len) * num_kv_heads * head_dim;
+    float* d_k_fp32;
+    float* d_v_fp32;
+    cudaMalloc(&d_k_fp32, cache_size * sizeof(float));
+    cudaMalloc(&d_v_fp32, cache_size * sizeof(float));
+    
+    int block = 256;
+    int grid = (cache_size + 255) / 256;
+    convert_fp16_to_fp32_batch_kernel<<<grid, block, 0, stream>>>(K_cache, d_k_fp32, cache_size);
+    convert_fp16_to_fp32_batch_kernel<<<grid, block, 0, stream>>>(V_cache, d_v_fp32, cache_size);
+    
+    launch_flash_attn_v2_prefill(Q, d_k_fp32, d_v_fp32, output, num_heads, num_kv_heads,
+                                  head_dim, seq_len, batch_size, layer_idx, max_seq_len, scale, stream);
+    
+    cudaFree(d_k_fp32);
+    cudaFree(d_v_fp32);
 }
 
 } // namespace cuda

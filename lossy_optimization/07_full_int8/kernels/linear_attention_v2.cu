@@ -1,37 +1,134 @@
 #include "linear_attention_v2.cuh"
-#include "cublas_handle_pool.hpp"
 #include "cuda_utils.cuh"
 #include "cuda_error_handling.cuh"
-#include <cublas_v2.h>
+#include "cutlass_gemm_wrapper.cuh"
 #include <cmath>
 #include <cstdio>
 
 namespace qwen {
 namespace cuda {
 
-#define LA_V2_CUBLAS_CHECK(call)                                                                    \
-    do {                                                                                            \
-        cublasStatus_t _err = (call);                                                               \
-        if (_err != CUBLAS_STATUS_SUCCESS) {                                                        \
-            fprintf(stderr, "cuBLAS error %d at %s:%d\n", static_cast<int>(_err), __FILE__,         \
-                    __LINE__);                                                                      \
-            exit(1);                                                                                \
-        }                                                                                           \
-    } while (0)
-
 namespace {
 
-__global__ void linear_proj_v2_kernel(const float* __restrict__ input, float* __restrict__ output,
-                                      const float* __restrict__ weight, int hidden_size,
-                                      int out_size) {
+// Optimized linear projection v2 using shared memory tiling
+template <int TILE_M, int TILE_K, int THREADS>
+__global__ void linear_proj_v2_kernel_optimized(const float* __restrict__ input,
+                                                float* __restrict__ output,
+                                                const float* __restrict__ weight, int hidden_size,
+                                                int out_size) {
+    __shared__ float s_input[TILE_K];
+    __shared__ float s_weight[TILE_M][TILE_K + 1];
+
+    const int row_base = blockIdx.x * TILE_M;
+    const int tid = threadIdx.x;
+
+    const int rows_per_thread = (TILE_M + THREADS - 1) / THREADS;
+    const int my_row_start = tid * rows_per_thread;
+    const int my_row_end = min(my_row_start + rows_per_thread, TILE_M);
+
+    float accum[8] = {0.0f};
+
+    for (int k_tile = 0; k_tile < hidden_size; k_tile += TILE_K) {
+        int k_end = min(k_tile + TILE_K, hidden_size);
+        int k_len = k_end - k_tile;
+
+        for (int k = tid; k < k_len; k += THREADS) {
+            s_input[k] = input[k_tile + k];
+        }
+
+        for (int r = my_row_start; r < my_row_end; ++r) {
+            int global_row = row_base + r;
+            if (global_row < out_size) {
+                const float* w_row = weight + global_row * hidden_size + k_tile;
+                for (int k = 0; k < k_len; ++k) {
+                    s_weight[r][k] = w_row[k];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        for (int r = my_row_start; r < my_row_end; ++r) {
+            int global_row = row_base + r;
+            if (global_row < out_size) {
+                float sum = accum[r - my_row_start];
+                #pragma unroll 4
+                for (int k = 0; k < k_len; ++k) {
+                    sum += s_weight[r][k] * s_input[k];
+                }
+                accum[r - my_row_start] = sum;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for (int r = my_row_start; r < my_row_end; ++r) {
+        int global_row = row_base + r;
+        if (global_row < out_size) {
+            output[global_row] = accum[r - my_row_start];
+        }
+    }
+}
+
+// Simple fallback
+__global__ void linear_proj_v2_kernel_simple(const float* __restrict__ input, float* __restrict__ output,
+                                             const float* __restrict__ weight, int hidden_size,
+                                             int out_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= out_size)
-        return;
+    if (idx >= out_size) return;
     float sum = 0.0f;
+    #pragma unroll 4
     for (int j = 0; j < hidden_size; ++j) {
         sum += weight[idx * hidden_size + j] * input[j];
     }
     output[idx] = sum;
+}
+
+static void launch_linear_proj_v2(const float* input, float* output, const float* weight,
+                                  int hidden_size, int out_size, cudaStream_t stream = 0) {
+    if (out_size < 128 || hidden_size < 128) {
+        int block = 256;
+        int grid = (out_size + block - 1) / block;
+        linear_proj_v2_kernel_simple<<<grid, block, 0, stream>>>(input, output, weight, hidden_size, out_size);
+        return;
+    }
+
+    // Use CUTLASS-style warp-level GEMV
+    bool aligned = ((uintptr_t)weight % 16 == 0) &&
+                   ((uintptr_t)input % 16 == 0) &&
+                   (hidden_size % 4 == 0);
+
+    if (aligned) {
+        launch_cutlass_gemv(weight, input, output, out_size, hidden_size, stream);
+    } else {
+        const int TILE_M = 32;
+        const int TILE_K = 256;
+        const int THREADS = 256;
+        int grid = (out_size + TILE_M - 1) / TILE_M;
+        linear_proj_v2_kernel_optimized<TILE_M, TILE_K, THREADS>
+            <<<grid, THREADS, 0, stream>>>(input, output, weight, hidden_size, out_size);
+    }
+}
+
+// Keep old name for backward compatibility - device function wrapper
+__device__ void linear_proj_v2_kernel_device(const float* __restrict__ input, float* __restrict__ output,
+                                      const float* __restrict__ weight, int hidden_size,
+                                      int out_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= out_size) return;
+    float sum = 0.0f;
+    #pragma unroll 4
+    for (int j = 0; j < hidden_size; ++j) {
+        sum += weight[idx * hidden_size + j] * input[j];
+    }
+    output[idx] = sum;
+}
+
+__global__ void linear_proj_v2_kernel(const float* __restrict__ input, float* __restrict__ output,
+                                      const float* __restrict__ weight, int hidden_size,
+                                      int out_size) {
+    linear_proj_v2_kernel_device(input, output, weight, hidden_size, out_size);
 }
 
 __global__ void conv1d_update_fused_v2_kernel(const float* __restrict__ mixed_qkv,
@@ -113,17 +210,125 @@ __global__ void norm_gate_fused_v2_kernel(float* __restrict__ data,
     }
 }
 
-__global__ void la_output_proj_v2_kernel(const float* __restrict__ attn_out, float* __restrict__ output,
-                                         const float* __restrict__ out_weight, int input_dim,
-                                         int output_dim) {
+// Optimized output projection v2 using shared memory tiling
+template <int TILE_M, int TILE_K, int THREADS>
+__global__ void la_output_proj_v2_kernel_optimized(const float* __restrict__ attn_out,
+                                                   float* __restrict__ output,
+                                                   const float* __restrict__ out_weight, int input_dim,
+                                                   int output_dim) {
+    __shared__ float s_attn[TILE_K];
+    __shared__ float s_weight[TILE_M][TILE_K + 1];
+
+    const int row_base = blockIdx.x * TILE_M;
+    const int tid = threadIdx.x;
+
+    const int rows_per_thread = (TILE_M + THREADS - 1) / THREADS;
+    const int my_row_start = tid * rows_per_thread;
+    const int my_row_end = min(my_row_start + rows_per_thread, TILE_M);
+
+    float accum[8] = {0.0f};
+
+    for (int k_tile = 0; k_tile < input_dim; k_tile += TILE_K) {
+        int k_end = min(k_tile + TILE_K, input_dim);
+        int k_len = k_end - k_tile;
+
+        for (int k = tid; k < k_len; k += THREADS) {
+            s_attn[k] = attn_out[k_tile + k];
+        }
+
+        for (int r = my_row_start; r < my_row_end; ++r) {
+            int global_row = row_base + r;
+            if (global_row < output_dim) {
+                const float* w_row = out_weight + global_row * input_dim + k_tile;
+                for (int k = 0; k < k_len; ++k) {
+                    s_weight[r][k] = w_row[k];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        for (int r = my_row_start; r < my_row_end; ++r) {
+            int global_row = row_base + r;
+            if (global_row < output_dim) {
+                float sum = accum[r - my_row_start];
+                #pragma unroll 4
+                for (int k = 0; k < k_len; ++k) {
+                    sum += s_weight[r][k] * s_attn[k];
+                }
+                accum[r - my_row_start] = sum;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for (int r = my_row_start; r < my_row_end; ++r) {
+        int global_row = row_base + r;
+        if (global_row < output_dim) {
+            output[global_row] = accum[r - my_row_start];
+        }
+    }
+}
+
+// Simple fallback
+__global__ void la_output_proj_v2_kernel_simple(const float* __restrict__ attn_out, float* __restrict__ output,
+                                                const float* __restrict__ out_weight, int input_dim,
+                                                int output_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= output_dim)
-        return;
+    if (idx >= output_dim) return;
     float sum = 0.0f;
+    #pragma unroll 4
     for (int j = 0; j < input_dim; ++j) {
         sum += out_weight[idx * input_dim + j] * attn_out[j];
     }
     output[idx] = sum;
+}
+
+static void launch_la_output_proj_v2(const float* attn_out, float* output, const float* out_weight,
+                                     int input_dim, int output_dim, cudaStream_t stream = 0) {
+    if (output_dim < 128 || input_dim < 128) {
+        int block = 256;
+        int grid = (output_dim + block - 1) / block;
+        la_output_proj_v2_kernel_simple<<<grid, block, 0, stream>>>(attn_out, output, out_weight, input_dim, output_dim);
+        return;
+    }
+
+    // Use CUTLASS-style warp-level GEMV
+    bool aligned = ((uintptr_t)out_weight % 16 == 0) &&
+                   ((uintptr_t)attn_out % 16 == 0) &&
+                   (input_dim % 4 == 0);
+
+    if (aligned) {
+        launch_cutlass_gemv(out_weight, attn_out, output, output_dim, input_dim, stream);
+    } else {
+        const int TILE_M = 32;
+        const int TILE_K = 256;
+        const int THREADS = 256;
+        int grid = (output_dim + TILE_M - 1) / TILE_M;
+        la_output_proj_v2_kernel_optimized<TILE_M, TILE_K, THREADS>
+            <<<grid, THREADS, 0, stream>>>(attn_out, output, out_weight, input_dim, output_dim);
+    }
+}
+
+// Keep old name for backward compatibility - device function wrapper
+__device__ void la_output_proj_v2_kernel_device(const float* __restrict__ attn_out, float* __restrict__ output,
+                                         const float* __restrict__ out_weight, int input_dim,
+                                         int output_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= output_dim) return;
+    float sum = 0.0f;
+    #pragma unroll 4
+    for (int j = 0; j < input_dim; ++j) {
+        sum += out_weight[idx * input_dim + j] * attn_out[j];
+    }
+    output[idx] = sum;
+}
+
+__global__ void la_output_proj_v2_kernel(const float* __restrict__ attn_out, float* __restrict__ output,
+                                         const float* __restrict__ out_weight, int input_dim,
+                                         int output_dim) {
+    la_output_proj_v2_kernel_device(attn_out, output, out_weight, input_dim, output_dim);
 }
 
 __global__ void conv1d_update_fused_batch_v2_kernel(
@@ -538,12 +743,10 @@ void CudaLinearAttentionV2::forward(const float* input, float* output,
     float* d_a = d_a_buf_;
     float* d_b_raw = d_b_raw_buf_;
 
-    dim3 block(256);
-    dim3 grid((conv_dim + 255) / 256);
-    linear_proj_v2_kernel<<<grid, block>>>(input, d_mixed_qkv, d_in_proj_qkv_weight_, hidden_size_,
-                                           conv_dim);
+    launch_linear_proj_v2(input, d_mixed_qkv, d_in_proj_qkv_weight_, hidden_size_, conv_dim);
     CUDA_CHECK_LAST_KERNEL();
 
+    dim3 block(256);
     dim3 conv_grid((conv_dim + 255) / 256);
     conv1d_update_fused_v2_kernel<<<conv_grid, block>>>(d_mixed_qkv, d_conv_out, state.d_conv_state,
                                                         d_conv1d_weight_, conv_dim, conv_kernel_);
@@ -555,17 +758,12 @@ void CudaLinearAttentionV2::forward(const float* input, float* output,
                                                   num_heads_, key_dim_, q_scale, l2norm_eps);
     CUDA_CHECK_LAST_KERNEL();
 
-    dim3 small_grid((num_heads_ + 255) / 256);
-    linear_proj_v2_kernel<<<small_grid, block>>>(input, d_a, d_in_proj_a_weight_, hidden_size_,
-                                                 num_heads_);
+    launch_linear_proj_v2(input, d_a, d_in_proj_a_weight_, hidden_size_, num_heads_);
     CUDA_CHECK_LAST_KERNEL();
-    linear_proj_v2_kernel<<<small_grid, block>>>(input, d_b_raw, d_in_proj_b_weight_, hidden_size_,
-                                                 num_heads_);
+    launch_linear_proj_v2(input, d_b_raw, d_in_proj_b_weight_, hidden_size_, num_heads_);
     CUDA_CHECK_LAST_KERNEL();
 
-    dim3 z_grid((z_dim + 255) / 256);
-    linear_proj_v2_kernel<<<z_grid, block>>>(input, d_z_buf_, d_in_proj_z_weight_, hidden_size_,
-                                             z_dim);
+    launch_linear_proj_v2(input, d_z_buf_, d_in_proj_z_weight_, hidden_size_, z_dim);
     CUDA_CHECK_LAST_KERNEL();
 
     float* d_attn_out = d_attn_out_buf_;
@@ -585,10 +783,7 @@ void CudaLinearAttentionV2::forward(const float* input, float* output,
         d_attn_out, d_norm_weight_, d_z_buf_, num_heads_, value_dim_, l2norm_eps);
     CUDA_CHECK_LAST_KERNEL();
 
-    dim3 proj_block(256);
-    dim3 proj_grid((hidden_size_ + 255) / 256);
-    la_output_proj_v2_kernel<<<proj_grid, proj_block>>>(d_attn_out, output, d_out_proj_weight_, z_dim,
-                                                        hidden_size_);
+    launch_la_output_proj_v2(d_attn_out, output, d_out_proj_weight_, z_dim, hidden_size_);
     CUDA_CHECK_LAST_KERNEL();
 }
 
@@ -601,8 +796,6 @@ void CudaLinearAttentionV2::forward_batch(const float* input, float* output,
     }
 
     ensure_batch_buffers(batch_size);
-    cublasHandle_t cublas_handle = CublasHandlePool::instance().get();
-    cublasSetStream(cublas_handle, stream);
 
     int k_dim = num_heads_ * key_dim_;
     int v_dim = num_heads_ * value_dim_;
@@ -624,31 +817,31 @@ void CudaLinearAttentionV2::forward_batch(const float* input, float* output,
         d_batch_conv_state, state.d_conv_state, static_cast<int>(conv_state_per_token), batch_size);
     CUDA_CHECK_LAST_KERNEL();
 
-    const float alpha = 1.0f, beta = 0.0f;
+    dim3 block(256);
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                    conv_dim, batch_size, hidden_size_,
-                                    &alpha, d_in_proj_qkv_weight_, hidden_size_,
-                                    input, hidden_size_,
-                                    &beta, d_mixed_qkv, conv_dim));
+    for (int b = 0; b < batch_size; ++b) {
+        launch_linear_proj_v2(
+            input + b * hidden_size_, d_mixed_qkv + b * conv_dim,
+            d_in_proj_qkv_weight_, hidden_size_, conv_dim, stream);
+    }
+    CUDA_CHECK_LAST_KERNEL();
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                    num_heads_, batch_size, hidden_size_,
-                                    &alpha, d_in_proj_a_weight_, hidden_size_,
-                                    input, hidden_size_,
-                                    &beta, d_a, num_heads_));
+    for (int b = 0; b < batch_size; ++b) {
+        launch_linear_proj_v2(
+            input + b * hidden_size_, d_a + b * num_heads_,
+            d_in_proj_a_weight_, hidden_size_, num_heads_, stream);
+        launch_linear_proj_v2(
+            input + b * hidden_size_, d_b_raw + b * num_heads_,
+            d_in_proj_b_weight_, hidden_size_, num_heads_, stream);
+    }
+    CUDA_CHECK_LAST_KERNEL();
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                    num_heads_, batch_size, hidden_size_,
-                                    &alpha, d_in_proj_b_weight_, hidden_size_,
-                                    input, hidden_size_,
-                                    &beta, d_b_raw, num_heads_));
-
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                    z_dim, batch_size, hidden_size_,
-                                    &alpha, d_in_proj_z_weight_, hidden_size_,
-                                    input, hidden_size_,
-                                    &beta, d_z, z_dim));
+    for (int b = 0; b < batch_size; ++b) {
+        launch_linear_proj_v2(
+            input + b * hidden_size_, d_z + b * z_dim,
+            d_in_proj_z_weight_, hidden_size_, z_dim, stream);
+    }
+    CUDA_CHECK_LAST_KERNEL();
 
     dim3 conv_block(256);
     dim3 conv_grid((conv_dim + 255) / 256, batch_size);
@@ -677,11 +870,12 @@ void CudaLinearAttentionV2::forward_batch(const float* input, float* output,
         d_attn_out, d_norm_weight_, d_z, num_heads_, value_dim_, l2norm_eps, batch_size);
     CUDA_CHECK_LAST_KERNEL();
 
-    LA_V2_CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                    hidden_size_, batch_size, z_dim,
-                                    &alpha, d_out_proj_weight_, z_dim,
-                                    d_attn_out, z_dim,
-                                    &beta, output, hidden_size_));
+    for (int b = 0; b < batch_size; ++b) {
+        launch_la_output_proj_v2(
+            d_attn_out + b * z_dim, output + b * hidden_size_,
+            d_out_proj_weight_, z_dim, hidden_size_, stream);
+    }
+    CUDA_CHECK_LAST_KERNEL();
 
     cudaMemcpyAsync(state.d_conv_state,
                     d_batch_conv_state + (batch_size - 1) * conv_state_per_token,

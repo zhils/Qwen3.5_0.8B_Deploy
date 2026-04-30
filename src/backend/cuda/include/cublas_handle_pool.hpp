@@ -30,8 +30,21 @@ class CublasHandlePool {
 
   private:
     CublasHandlePool() {
-        CUBLAS_CHECK(cublasCreate(&handle_));
-        CUBLAS_CHECK(cublasSetMathMode(handle_, CUBLAS_TF32_TENSOR_OP_MATH));
+        // Check CUDA context
+        cudaError_t cuda_err = cudaFree(0);
+        if (cuda_err != cudaSuccess) {
+            // No CUDA context available - create one
+            cudaSetDevice(0);
+            cudaFree(0);
+        }
+        
+        cublasStatus_t status = cublasCreate(&handle_);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error(std::string("cuBLAS error ") +
+                                     std::to_string(static_cast<int>(status)) +
+                                     " during cublasCreate at " + __FILE__ +
+                                     ":" + std::to_string(__LINE__));
+        }
     }
 
     ~CublasHandlePool() {

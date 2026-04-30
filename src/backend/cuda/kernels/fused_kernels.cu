@@ -7,8 +7,10 @@
  */
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cfloat>
 #include <cmath>
+#include <cstdint>
 
 namespace qwen {
 namespace cuda {
@@ -364,6 +366,104 @@ void launch_flash_attn_v2_prefill(
     } else {
         launch(flash_attn_v2_prefill_kernel<256, 32>);
     }
+}
+
+__global__ void convert_fp16_to_fp32_batch_kernel(const half* __restrict__ fp16, float* __restrict__ fp32, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) fp32[i] = __half2float(fp16[i]);
+}
+
+void launch_flash_attn_v2_prefill_fp16_cache(
+    const float* Q,
+    const half* K_cache,
+    const half* V_cache,
+    float* output,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int batch_size,
+    int layer_idx,
+    int max_seq_len,
+    float scale,
+    cudaStream_t stream) {
+    
+    // Convert cache for layers 0 to layer_idx (inclusive)
+    // The kernel accesses cache using: layer_idx * max_seq_len * num_kv_heads * head_dim + ...
+    // So we need to convert cache from layer 0 to layer_idx
+    size_t layer_cache_size = static_cast<size_t>(max_seq_len) * num_kv_heads * head_dim;
+    size_t total_cache_size = static_cast<size_t>(layer_idx + 1) * layer_cache_size;
+    
+    float* d_k_fp32;
+    float* d_v_fp32;
+    cudaMalloc(&d_k_fp32, total_cache_size * sizeof(float));
+    cudaMalloc(&d_v_fp32, total_cache_size * sizeof(float));
+    
+    int block = 256;
+    int grid = (total_cache_size + 255) / 256;
+    convert_fp16_to_fp32_batch_kernel<<<grid, block, 0, stream>>>(K_cache, d_k_fp32, total_cache_size);
+    convert_fp16_to_fp32_batch_kernel<<<grid, block, 0, stream>>>(V_cache, d_v_fp32, total_cache_size);
+    
+    launch_flash_attn_v2_prefill(Q, d_k_fp32, d_v_fp32, output, num_heads, num_kv_heads,
+                                  head_dim, seq_len, batch_size, layer_idx, max_seq_len, scale, stream);
+    
+    cudaFree(d_k_fp32);
+    cudaFree(d_v_fp32);
+}
+
+__global__ void dequantize_int8_to_fp32_batch_kernel(const int8_t* __restrict__ int8_data,
+                                                     float* __restrict__ fp32_data,
+                                                     const float* __restrict__ scales,
+                                                     int n, int head_dim, int num_kv_heads) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    // Each element belongs to a specific head, get the scale for that head
+    // Layout: [seq_len, num_kv_heads, head_dim]
+    // For element at position i, the head index is (i / head_dim) % num_kv_heads
+    int head_idx = (i / head_dim) % num_kv_heads;
+    fp32_data[i] = static_cast<float>(int8_data[i]) * scales[head_idx];
+}
+
+void launch_flash_attn_v2_prefill_int8_cache(
+    const float* Q,
+    const int8_t* K_cache,
+    const int8_t* V_cache,
+    const float* K_scale,
+    const float* V_scale,
+    float* output,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int batch_size,
+    int layer_idx,
+    int max_seq_len,
+    float scale,
+    cudaStream_t stream) {
+    
+    // Convert cache for layers 0 to layer_idx (inclusive)
+    size_t layer_cache_size = static_cast<size_t>(max_seq_len) * num_kv_heads * head_dim;
+    size_t total_cache_size = static_cast<size_t>(layer_idx + 1) * layer_cache_size;
+    size_t scale_size = static_cast<size_t>(layer_idx + 1) * max_seq_len * num_kv_heads;
+    
+    float* d_k_fp32;
+    float* d_v_fp32;
+    cudaMalloc(&d_k_fp32, total_cache_size * sizeof(float));
+    cudaMalloc(&d_v_fp32, total_cache_size * sizeof(float));
+    
+    int block = 256;
+    int grid = (total_cache_size + 255) / 256;
+    dequantize_int8_to_fp32_batch_kernel<<<grid, block, 0, stream>>>(
+        K_cache, d_k_fp32, K_scale, total_cache_size, head_dim, num_kv_heads);
+    dequantize_int8_to_fp32_batch_kernel<<<grid, block, 0, stream>>>(
+        V_cache, d_v_fp32, V_scale, total_cache_size, head_dim, num_kv_heads);
+    
+    launch_flash_attn_v2_prefill(Q, d_k_fp32, d_v_fp32, output, num_heads, num_kv_heads,
+                                  head_dim, seq_len, batch_size, layer_idx, max_seq_len, scale, stream);
+    
+    cudaFree(d_k_fp32);
+    cudaFree(d_v_fp32);
 }
 
 } // namespace cuda

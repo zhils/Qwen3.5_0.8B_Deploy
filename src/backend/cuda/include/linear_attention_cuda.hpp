@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <vector>
+#include <cuda_bf16.h>
 
 namespace qwen {
 namespace cuda {
@@ -56,12 +57,12 @@ class CudaLinearAttention {
     int value_dim_;
     int conv_kernel_;
 
-    float* d_in_proj_qkv_weight_;
-    float* d_in_proj_a_weight_;
-    float* d_in_proj_b_weight_;
-    float* d_in_proj_z_weight_;
-    float* d_conv1d_weight_;
-    float* d_out_proj_weight_;
+    __nv_bfloat16* d_in_proj_qkv_weight_;
+    __nv_bfloat16* d_in_proj_a_weight_;
+    __nv_bfloat16* d_in_proj_b_weight_;
+    __nv_bfloat16* d_in_proj_z_weight_;
+    __nv_bfloat16* d_conv1d_weight_;
+    __nv_bfloat16* d_out_proj_weight_;
     float* d_a_log_;
     float* d_dt_bias_;
     float* d_norm_weight_;

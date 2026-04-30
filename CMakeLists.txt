@@ -114,6 +114,7 @@ if(ENABLE_CUDA)
         src/backend/cuda/kernels/fa_set_weights.cu
         src/backend/cuda/kernels/fused_kernels.cu
         src/backend/cuda/kernels/linear_attention_fused.cu
+        src/backend/cuda/kernels/fusion_microbench_kernels.cu
     )
 
     add_library(qwen_cuda STATIC ${CUDA_KERNEL_SOURCES})
@@ -156,4 +157,10 @@ if(ENABLE_CUDA)
         ${CMAKE_SOURCE_DIR}/src/backend/cuda/tools
     )
     target_link_libraries(cuda_op_flowchart_demo PRIVATE qwen_cuda)
+
+    add_executable(fusion_compare_test src/backend/cuda/fusion_compare_test.cu)
+    target_link_libraries(fusion_compare_test PRIVATE qwen_cuda)
+
+    add_executable(e2e_fusion_test src/backend/cuda/e2e_fusion_test.cu)
+    target_link_libraries(e2e_fusion_test PRIVATE qwen_cuda)
 endif()

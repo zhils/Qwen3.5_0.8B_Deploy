@@ -1,7 +1,7 @@
 #include "full_attention_cuda.hpp"
 #include "flash_attention.cuh"
 #include "fused_kernels.cuh"
-#include "cublas_handle_pool.hpp"
+#include "cutlass_gemm_wrapper.cuh"
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
@@ -15,24 +15,15 @@
         }                                                                                          \
     }
 
-#define FA_CUBLAS_CHECK(call)                                                                      \
-    do {                                                                                           \
-        cublasStatus_t _err = (call);                                                              \
-        if (_err != CUBLAS_STATUS_SUCCESS) {                                                       \
-            fprintf(stderr, "cuBLAS error %d at %s:%d\n", static_cast<int>(_err), __FILE__, __LINE__); \
-            exit(1);                                                                               \
-        }                                                                                          \
-    } while (0)
-
 namespace qwen {
 namespace cuda {
 
-__global__ void fused_q_path_kernel_bf16(const float* __restrict__ input,
-                                         const __nv_bfloat16* __restrict__ q_weight,
-                                         const float* __restrict__ q_norm_weight,
-                                         float* __restrict__ d_q, float* __restrict__ d_gate,
-                                         int hidden_size, int num_heads, int q_head_dim, int kv_head_dim,
-                                         int rotary_dim, float rope_base, int position, float eps) {
+__global__ void fused_q_path_kernel(const float* __restrict__ input,
+                                    const float* __restrict__ q_weight,
+                                    const float* __restrict__ q_norm_weight,
+                                    float* __restrict__ d_q, float* __restrict__ d_gate,
+                                    int hidden_size, int num_heads, int q_head_dim, int kv_head_dim,
+                                    int rotary_dim, float rope_base, int position, float eps) {
     int h = blockIdx.x;
     if (h >= num_heads)
         return;
@@ -43,10 +34,8 @@ __global__ void fused_q_path_kernel_bf16(const float* __restrict__ input,
         float sq = 0.0f, sg = 0.0f;
         for (int j = 0; j < hidden_size; ++j) {
             float x = input[j];
-            float wq = __bfloat162float(q_weight[q_row * hidden_size + j]);
-            float wg = __bfloat162float(q_weight[g_row * hidden_size + j]);
-            sq += wq * x;
-            sg += wg * x;
+            sq += q_weight[q_row * hidden_size + j] * x;
+            sg += q_weight[g_row * hidden_size + j] * x;
         }
         d_q[h * q_head_dim + tid] = sq;
         d_gate[h * q_head_dim + tid] = sg;
@@ -77,14 +66,12 @@ __global__ void fused_q_path_kernel_bf16(const float* __restrict__ input,
     }
 }
 
-__global__ void fused_kv_cache_kernel_bf16(const float* __restrict__ input,
-                                           const __nv_bfloat16* __restrict__ k_weight,
-                                           const __nv_bfloat16* __restrict__ v_weight,
-                                           const float* __restrict__ k_norm_weight,
-                                           float* __restrict__ k_cache_slot,
-                                           float* __restrict__ v_cache_slot,
-                                           int hidden_size, int num_kv_heads, int kv_head_dim,
-                                           int rotary_dim, float rope_base, int position, float eps) {
+__global__ void
+fused_kv_cache_kernel(const float* __restrict__ input, const float* __restrict__ k_weight,
+                      const float* __restrict__ v_weight, const float* __restrict__ k_norm_weight,
+                      float* __restrict__ k_cache_slot, float* __restrict__ v_cache_slot,
+                      int hidden_size, int num_kv_heads, int kv_head_dim, int rotary_dim,
+                      float rope_base, int position, float eps) {
     int h = blockIdx.x;
     if (h >= num_kv_heads)
         return;
@@ -96,10 +83,8 @@ __global__ void fused_kv_cache_kernel_bf16(const float* __restrict__ input,
         float ak = 0.0f, av = 0.0f;
         for (int j = 0; j < hidden_size; ++j) {
             float x = input[j];
-            float wk = __bfloat162float(k_weight[(h * kv_head_dim + tid) * hidden_size + j]);
-            float wv = __bfloat162float(v_weight[(h * kv_head_dim + tid) * hidden_size + j]);
-            ak += wk * x;
-            av += wv * x;
+            ak += k_weight[(h * kv_head_dim + tid) * hidden_size + j] * x;
+            av += v_weight[(h * kv_head_dim + tid) * hidden_size + j] * x;
         }
         sk[tid] = ak;
         sv[tid] = av;
@@ -145,18 +130,127 @@ __global__ void gate_sigmoid_kernel(float* __restrict__ d_attn_out,
     d_attn_out[h * kv_head_dim + d] *= 1.0f / (1.0f + expf(-g));
 }
 
-__global__ void output_proj_kernel_bf16(const float* __restrict__ attn_out, float* __restrict__ output,
-                                        const __nv_bfloat16* __restrict__ weight, int total_out,
-                                        int hidden_size) {
+// Optimized output projection using shared memory tiling
+template <int TILE_M, int TILE_K, int THREADS>
+__global__ void output_proj_kernel_optimized(const float* __restrict__ attn_out,
+                                             float* __restrict__ output,
+                                             const float* __restrict__ weight, int total_out,
+                                             int hidden_size) {
+    __shared__ float s_attn[TILE_K];
+    __shared__ float s_weight[TILE_M][TILE_K + 1];
+
+    const int row_base = blockIdx.x * TILE_M;
+    const int tid = threadIdx.x;
+
+    const int rows_per_thread = (TILE_M + THREADS - 1) / THREADS;
+    const int my_row_start = tid * rows_per_thread;
+    const int my_row_end = min(my_row_start + rows_per_thread, TILE_M);
+
+    float accum[8] = {0.0f};
+
+    for (int k_tile = 0; k_tile < total_out; k_tile += TILE_K) {
+        int k_end = min(k_tile + TILE_K, total_out);
+        int k_len = k_end - k_tile;
+
+        for (int k = tid; k < k_len; k += THREADS) {
+            s_attn[k] = attn_out[k_tile + k];
+        }
+
+        for (int r = my_row_start; r < my_row_end; ++r) {
+            int global_row = row_base + r;
+            if (global_row < hidden_size) {
+                const float* w_row = weight + global_row * total_out + k_tile;
+                for (int k = 0; k < k_len; ++k) {
+                    s_weight[r][k] = w_row[k];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        for (int r = my_row_start; r < my_row_end; ++r) {
+            int global_row = row_base + r;
+            if (global_row < hidden_size) {
+                float sum = accum[r - my_row_start];
+                #pragma unroll 4
+                for (int k = 0; k < k_len; ++k) {
+                    sum += s_weight[r][k] * s_attn[k];
+                }
+                accum[r - my_row_start] = sum;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for (int r = my_row_start; r < my_row_end; ++r) {
+        int global_row = row_base + r;
+        if (global_row < hidden_size) {
+            output[global_row] = accum[r - my_row_start];
+        }
+    }
+}
+
+// Simple fallback
+__global__ void output_proj_kernel_simple(const float* __restrict__ attn_out,
+                                          float* __restrict__ output,
+                                          const float* __restrict__ weight, int total_out,
+                                          int hidden_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= hidden_size)
-        return;
+    if (idx >= hidden_size) return;
     float sum = 0.0f;
+    #pragma unroll 4
     for (int j = 0; j < total_out; ++j) {
-        float w = __bfloat162float(weight[idx * total_out + j]);
-        sum += w * attn_out[j];
+        sum += weight[idx * total_out + j] * attn_out[j];
     }
     output[idx] = sum;
+}
+
+static void launch_output_proj(const float* attn_out, float* output, const float* weight,
+                               int total_out, int hidden_size, cudaStream_t stream = 0) {
+    if (hidden_size < 128 || total_out < 128) {
+        int block = 256;
+        int grid = (hidden_size + block - 1) / block;
+        output_proj_kernel_simple<<<grid, block, 0, stream>>>(attn_out, output, weight, total_out, hidden_size);
+        return;
+    }
+
+    // Use CUTLASS-style warp-level GEMV
+    bool aligned = ((uintptr_t)weight % 16 == 0) &&
+                   ((uintptr_t)attn_out % 16 == 0) &&
+                   (total_out % 4 == 0);
+
+    if (aligned) {
+        launch_cutlass_gemv(weight, attn_out, output, hidden_size, total_out, stream);
+    } else {
+        // Fallback to shared memory tiling
+        const int TILE_M = 32;
+        const int TILE_K = 256;
+        const int THREADS = 256;
+        int grid = (hidden_size + TILE_M - 1) / TILE_M;
+        output_proj_kernel_optimized<TILE_M, TILE_K, THREADS>
+            <<<grid, THREADS, 0, stream>>>(attn_out, output, weight, total_out, hidden_size);
+    }
+}
+
+// Keep old name for backward compatibility - device function wrapper
+__device__ void output_proj_kernel_device(const float* __restrict__ attn_out, float* __restrict__ output,
+                                   const float* __restrict__ weight, int total_out,
+                                   int hidden_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_size) return;
+    float sum = 0.0f;
+    #pragma unroll 4
+    for (int j = 0; j < total_out; ++j) {
+        sum += weight[idx * total_out + j] * attn_out[j];
+    }
+    output[idx] = sum;
+}
+
+__global__ void output_proj_kernel(const float* __restrict__ attn_out, float* __restrict__ output,
+                                   const float* __restrict__ weight, int total_out,
+                                   int hidden_size) {
+    output_proj_kernel_device(attn_out, output, weight, total_out, hidden_size);
 }
 
 CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_heads,
@@ -173,10 +267,10 @@ CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_
     int total_kv = num_kv_heads_ * kv_head_dim_;
     int total_out = num_heads_ * kv_head_dim_;
 
-    cudaMalloc(&d_q_proj_weight_, static_cast<size_t>(total_q * 2) * hidden_size_ * sizeof(__nv_bfloat16));
-    cudaMalloc(&d_k_proj_weight_, static_cast<size_t>(total_kv) * hidden_size_ * sizeof(__nv_bfloat16));
-    cudaMalloc(&d_v_proj_weight_, static_cast<size_t>(total_kv) * hidden_size_ * sizeof(__nv_bfloat16));
-    cudaMalloc(&d_o_proj_weight_, static_cast<size_t>(hidden_size_) * total_out * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_q_proj_weight_, static_cast<size_t>(total_q * 2) * hidden_size_ * sizeof(float));
+    cudaMalloc(&d_k_proj_weight_, static_cast<size_t>(total_kv) * hidden_size_ * sizeof(float));
+    cudaMalloc(&d_v_proj_weight_, static_cast<size_t>(total_kv) * hidden_size_ * sizeof(float));
+    cudaMalloc(&d_o_proj_weight_, static_cast<size_t>(hidden_size_) * total_out * sizeof(float));
     cudaMalloc(&d_q_norm_weight_, static_cast<size_t>(kv_head_dim_) * sizeof(float));
     cudaMalloc(&d_k_norm_weight_, static_cast<size_t>(kv_head_dim_) * sizeof(float));
 
@@ -189,18 +283,30 @@ CudaFullAttention::CudaFullAttention(int hidden_size, int num_heads, int num_kv_
 }
 
 CudaFullAttention::~CudaFullAttention() {
-    if (d_q_proj_weight_) cudaFree(d_q_proj_weight_);
-    if (d_k_proj_weight_) cudaFree(d_k_proj_weight_);
-    if (d_v_proj_weight_) cudaFree(d_v_proj_weight_);
-    if (d_o_proj_weight_) cudaFree(d_o_proj_weight_);
-    if (d_q_norm_weight_) cudaFree(d_q_norm_weight_);
-    if (d_k_norm_weight_) cudaFree(d_k_norm_weight_);
-    if (d_q_buf_) cudaFree(d_q_buf_);
-    if (d_gate_buf_) cudaFree(d_gate_buf_);
-    if (d_k_buf_) cudaFree(d_k_buf_);
-    if (d_v_buf_) cudaFree(d_v_buf_);
-    if (d_attn_out_buf_) cudaFree(d_attn_out_buf_);
-    if (d_attn_scores_buf_) cudaFree(d_attn_scores_buf_);
+    if (d_q_proj_weight_)
+        cudaFree(d_q_proj_weight_);
+    if (d_k_proj_weight_)
+        cudaFree(d_k_proj_weight_);
+    if (d_v_proj_weight_)
+        cudaFree(d_v_proj_weight_);
+    if (d_o_proj_weight_)
+        cudaFree(d_o_proj_weight_);
+    if (d_q_norm_weight_)
+        cudaFree(d_q_norm_weight_);
+    if (d_k_norm_weight_)
+        cudaFree(d_k_norm_weight_);
+    if (d_q_buf_)
+        cudaFree(d_q_buf_);
+    if (d_gate_buf_)
+        cudaFree(d_gate_buf_);
+    if (d_k_buf_)
+        cudaFree(d_k_buf_);
+    if (d_v_buf_)
+        cudaFree(d_v_buf_);
+    if (d_attn_out_buf_)
+        cudaFree(d_attn_out_buf_);
+    if (d_attn_scores_buf_)
+        cudaFree(d_attn_scores_buf_);
 }
 
 void CudaFullAttention::set_weights(const std::vector<float>& q_proj_weight,
@@ -213,28 +319,22 @@ void CudaFullAttention::set_weights(const std::vector<float>& q_proj_weight,
     int total_kv = num_kv_heads_ * kv_head_dim_;
     int total_out = num_heads_ * kv_head_dim_;
 
-    size_t q_size = static_cast<size_t>(total_q * 2) * hidden_size_;
-    size_t kv_size = static_cast<size_t>(total_kv) * hidden_size_;
-    size_t o_size = static_cast<size_t>(hidden_size_) * total_out;
-
-    std::vector<__nv_bfloat16> h_q_bf16(q_size);
-    std::vector<__nv_bfloat16> h_k_bf16(kv_size);
-    std::vector<__nv_bfloat16> h_v_bf16(kv_size);
-    std::vector<__nv_bfloat16> h_o_bf16(o_size);
-
-    for (size_t i = 0; i < q_size; ++i) h_q_bf16[i] = __float2bfloat16(q_proj_weight[i]);
-    for (size_t i = 0; i < kv_size; ++i) {
-        h_k_bf16[i] = __float2bfloat16(k_proj_weight[i]);
-        h_v_bf16[i] = __float2bfloat16(v_proj_weight[i]);
-    }
-    for (size_t i = 0; i < o_size; ++i) h_o_bf16[i] = __float2bfloat16(o_proj_weight[i]);
-
-    cudaMemcpy(d_q_proj_weight_, h_q_bf16.data(), q_size * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k_proj_weight_, h_k_bf16.data(), kv_size * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_proj_weight_, h_v_bf16.data(), kv_size * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_o_proj_weight_, h_o_bf16.data(), o_size * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_q_norm_weight_, q_norm_weight.data(), kv_head_dim_ * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k_norm_weight_, k_norm_weight.data(), kv_head_dim_ * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q_proj_weight_, q_proj_weight.data(),
+               static_cast<size_t>(total_q * 2) * hidden_size_ * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k_proj_weight_, k_proj_weight.data(),
+               static_cast<size_t>(total_kv) * hidden_size_ * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v_proj_weight_, v_proj_weight.data(),
+               static_cast<size_t>(total_kv) * hidden_size_ * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_o_proj_weight_, o_proj_weight.data(),
+               static_cast<size_t>(hidden_size_) * total_out * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q_norm_weight_, q_norm_weight.data(), kv_head_dim_ * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k_norm_weight_, k_norm_weight.data(), kv_head_dim_ * sizeof(float),
+               cudaMemcpyHostToDevice);
 }
 
 void CudaKVCache::reset(int nl, int nkh, int hd, int init_capacity) {
@@ -265,6 +365,7 @@ void CudaKVCache::grow(int new_capacity) {
     cudaMemset(new_k_cache, 0, new_total * sizeof(float));
     cudaMemset(new_v_cache, 0, new_total * sizeof(float));
 
+    // 拷贝旧数据
     if (d_k_cache && old_total > 0) {
         cudaMemcpy(new_k_cache, d_k_cache, old_total * sizeof(float), cudaMemcpyDeviceToDevice);
     }
@@ -283,10 +384,12 @@ void CudaKVCache::grow(int new_capacity) {
 void CudaKVCache::ensure_capacity(int required_seq_len) {
     if (required_seq_len <= capacity_seq_len) return;
 
+    // 2倍扩容策略，但不超过合理上限
     int new_capacity = capacity_seq_len * 2;
     while (new_capacity < required_seq_len) {
         new_capacity *= 2;
     }
+    // 设置一个合理的上限，防止无限增长
     const int MAX_REASONABLE_SEQ_LEN = 262144;
     if (new_capacity > MAX_REASONABLE_SEQ_LEN) {
         new_capacity = MAX_REASONABLE_SEQ_LEN;
@@ -329,16 +432,16 @@ void CudaFullAttention::forward(const float* input, float* output, CudaKVCache& 
 
     int rotary_dim = static_cast<int>(kv_head_dim_ * 0.25f);
 
-    fused_q_path_kernel_bf16<<<num_heads_, 256>>>(input, d_q_proj_weight_, d_q_norm_weight_, d_q, d_gate,
-                                                   hidden_size_, num_heads_, q_head_dim_, kv_head_dim_,
-                                                   rotary_dim, 10000000.0f, position, 1e-6f);
+    fused_q_path_kernel<<<num_heads_, 256>>>(input, d_q_proj_weight_, d_q_norm_weight_, d_q, d_gate,
+                                             hidden_size_, num_heads_, q_head_dim_, kv_head_dim_,
+                                             rotary_dim, 10000000.0f, position, 1e-6f);
     FA_CUDA_CHECK();
 
     size_t k_offset =
         static_cast<size_t>(layer_idx) * kv_cache.capacity_seq_len * num_kv_heads_ * kv_head_dim_ +
         static_cast<size_t>(position) * num_kv_heads_ * kv_head_dim_;
     size_t shmem_kv = 2 * kv_head_dim_ * sizeof(float);
-    fused_kv_cache_kernel_bf16<<<num_kv_heads_, 256, shmem_kv>>>(
+    fused_kv_cache_kernel<<<num_kv_heads_, 256, shmem_kv>>>(
         input, d_k_proj_weight_, d_v_proj_weight_, d_k_norm_weight_, kv_cache.d_k_cache + k_offset,
         kv_cache.d_v_cache + k_offset, hidden_size_, num_kv_heads_, kv_head_dim_, rotary_dim,
         10000000.0f, position, 1e-6f);
@@ -361,20 +464,17 @@ void CudaFullAttention::forward(const float* input, float* output, CudaKVCache& 
                                                       q_head_dim_);
     FA_CUDA_CHECK();
 
-    dim3 block_proj(256);
-    dim3 grid_proj((hidden_size_ + 255) / 256);
-    output_proj_kernel_bf16<<<grid_proj, block_proj>>>(d_attn_out, output, d_o_proj_weight_, total_out,
-                                                       hidden_size_);
+    launch_output_proj(d_attn_out, output, d_o_proj_weight_, total_out, hidden_size_);
     FA_CUDA_CHECK();
 }
 
-__global__ void batch_fused_q_path_kernel_bf16(const float* __restrict__ input,
-                                               const __nv_bfloat16* __restrict__ q_weight,
-                                               const float* __restrict__ q_norm_weight,
-                                               float* __restrict__ d_q, float* __restrict__ d_gate,
-                                               int hidden_size, int num_heads, int q_head_dim,
-                                               int kv_head_dim, int rotary_dim, float rope_base,
-                                               const int* positions, float eps, int batch_size) {
+__global__ void batch_fused_q_path_kernel(const float* __restrict__ input,
+                                          const float* __restrict__ q_weight,
+                                          const float* __restrict__ q_norm_weight,
+                                          float* __restrict__ d_q, float* __restrict__ d_gate,
+                                          int hidden_size, int num_heads, int q_head_dim,
+                                          int kv_head_dim, int rotary_dim, float rope_base,
+                                          const int* positions, float eps, int batch_size) {
     int h = blockIdx.x;
     int b = blockIdx.y;
     if (h >= num_heads || b >= batch_size)
@@ -391,10 +491,8 @@ __global__ void batch_fused_q_path_kernel_bf16(const float* __restrict__ input,
         float sq = 0.0f, sg = 0.0f;
         for (int j = 0; j < hidden_size; ++j) {
             float x = in_ptr[j];
-            float wq = __bfloat162float(q_weight[q_row * hidden_size + j]);
-            float wg = __bfloat162float(q_weight[g_row * hidden_size + j]);
-            sq += wq * x;
-            sg += wg * x;
+            sq += q_weight[q_row * hidden_size + j] * x;
+            sg += q_weight[g_row * hidden_size + j] * x;
         }
         q_ptr[h * q_head_dim + tid] = sq;
         g_ptr[h * q_head_dim + tid] = sg;
@@ -427,15 +525,15 @@ __global__ void batch_fused_q_path_kernel_bf16(const float* __restrict__ input,
     }
 }
 
-__global__ void batch_fused_kv_cache_kernel_bf16(const float* __restrict__ input,
-                                                 const __nv_bfloat16* __restrict__ k_weight,
-                                                 const __nv_bfloat16* __restrict__ v_weight,
-                                                 const float* __restrict__ k_norm_weight,
-                                                 float* __restrict__ k_cache,
-                                                 float* __restrict__ v_cache, int hidden_size,
-                                                 int num_kv_heads, int kv_head_dim, int rotary_dim,
-                                                 float rope_base, const int* positions, float eps,
-                                                 int batch_size, int layer_idx, int max_seq_len) {
+__global__ void batch_fused_kv_cache_kernel(const float* __restrict__ input,
+                                            const float* __restrict__ k_weight,
+                                            const float* __restrict__ v_weight,
+                                            const float* __restrict__ k_norm_weight,
+                                            float* __restrict__ k_cache,
+                                            float* __restrict__ v_cache, int hidden_size,
+                                            int num_kv_heads, int kv_head_dim, int rotary_dim,
+                                            float rope_base, const int* positions, float eps,
+                                            int batch_size, int layer_idx, int max_seq_len) {
     int h = blockIdx.x;
     int b = blockIdx.y;
     if (h >= num_kv_heads || b >= batch_size)
@@ -453,10 +551,8 @@ __global__ void batch_fused_kv_cache_kernel_bf16(const float* __restrict__ input
         float ak = 0.0f, av = 0.0f;
         for (int j = 0; j < hidden_size; ++j) {
             float x = in_ptr[j];
-            float wk = __bfloat162float(k_weight[(h * kv_head_dim + tid) * hidden_size + j]);
-            float wv = __bfloat162float(v_weight[(h * kv_head_dim + tid) * hidden_size + j]);
-            ak += wk * x;
-            av += wv * x;
+            ak += k_weight[(h * kv_head_dim + tid) * hidden_size + j] * x;
+            av += v_weight[(h * kv_head_dim + tid) * hidden_size + j] * x;
         }
         sk[tid] = ak;
         sv[tid] = av;
@@ -512,10 +608,10 @@ __global__ void batch_gate_sigmoid_kernel(float* __restrict__ d_attn_out,
     d_attn_out[idx] *= 1.0f / (1.0f + expf(-g));
 }
 
-__global__ void batch_output_proj_kernel_bf16(const float* __restrict__ attn_out,
-                                              float* __restrict__ output,
-                                              const __nv_bfloat16* __restrict__ weight, int total_out,
-                                              int hidden_size, int batch_size) {
+__global__ void batch_output_proj_kernel(const float* __restrict__ attn_out,
+                                         float* __restrict__ output,
+                                         const float* __restrict__ weight, int total_out,
+                                         int hidden_size, int batch_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int b = blockIdx.y;
     if (idx >= hidden_size || b >= batch_size)
@@ -524,8 +620,7 @@ __global__ void batch_output_proj_kernel_bf16(const float* __restrict__ attn_out
     float sum = 0.0f;
     const float* a_ptr = attn_out + b * total_out;
     for (int j = 0; j < total_out; ++j) {
-        float w = __bfloat162float(weight[idx * total_out + j]);
-        sum += w * a_ptr[j];
+        sum += weight[idx * total_out + j] * a_ptr[j];
     }
     output[b * hidden_size + idx] = sum;
 }
@@ -534,11 +629,16 @@ void CudaFullAttention::ensure_batch_buffers(int batch_size) const {
     if (batch_size <= max_batch_size_)
         return;
 
-    if (d_batch_q_buf_) cudaFree(d_batch_q_buf_);
-    if (d_batch_gate_buf_) cudaFree(d_batch_gate_buf_);
-    if (d_batch_k_buf_) cudaFree(d_batch_k_buf_);
-    if (d_batch_v_buf_) cudaFree(d_batch_v_buf_);
-    if (d_batch_attn_out_buf_) cudaFree(d_batch_attn_out_buf_);
+    if (d_batch_q_buf_)
+        cudaFree(d_batch_q_buf_);
+    if (d_batch_gate_buf_)
+        cudaFree(d_batch_gate_buf_);
+    if (d_batch_k_buf_)
+        cudaFree(d_batch_k_buf_);
+    if (d_batch_v_buf_)
+        cudaFree(d_batch_v_buf_);
+    if (d_batch_attn_out_buf_)
+        cudaFree(d_batch_attn_out_buf_);
 
     size_t total_q = static_cast<size_t>(batch_size) * num_heads_ * q_head_dim_;
     size_t total_kv = static_cast<size_t>(batch_size) * num_kv_heads_ * kv_head_dim_;
@@ -577,7 +677,7 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
     int total_out = num_heads_ * kv_head_dim_;
 
     dim3 q_grid(num_heads_, batch_size);
-    batch_fused_q_path_kernel_bf16<<<q_grid, 256>>>(
+    batch_fused_q_path_kernel<<<q_grid, 256>>>(
         input, d_q_proj_weight_, d_q_norm_weight_, d_batch_q_buf_, d_batch_gate_buf_,
         hidden_size_, num_heads_, q_head_dim_, kv_head_dim_, rotary_dim, 10000000.0f,
         positions, 1e-6f, batch_size);
@@ -585,7 +685,7 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
 
     size_t shmem_kv = 2 * kv_head_dim_ * sizeof(float);
     dim3 kv_grid(num_kv_heads_, batch_size);
-    batch_fused_kv_cache_kernel_bf16<<<kv_grid, 256, shmem_kv>>>(
+    batch_fused_kv_cache_kernel<<<kv_grid, 256, shmem_kv>>>(
         input, d_k_proj_weight_, d_v_proj_weight_, d_k_norm_weight_,
         kv_cache.d_k_cache, kv_cache.d_v_cache, hidden_size_, num_kv_heads_, kv_head_dim_,
         rotary_dim, 10000000.0f, positions, 1e-6f, batch_size, layer_idx, kv_cache.capacity_seq_len);
@@ -614,9 +714,12 @@ void CudaFullAttention::forward_batch_prefill(const float* input, float* output,
         d_batch_attn_out_buf_, d_batch_gate_buf_, num_heads_, kv_head_dim_, q_head_dim_, batch_size);
     FA_CUDA_CHECK();
 
-    dim3 out_grid((hidden_size_ + 255) / 256, batch_size);
-    batch_output_proj_kernel_bf16<<<out_grid, 256>>>(
-        d_batch_attn_out_buf_, output, d_o_proj_weight_, total_out, hidden_size_, batch_size);
+    for (int b = 0; b < batch_size; ++b) {
+        launch_output_proj(
+            d_batch_attn_out_buf_ + b * total_out,
+            output + b * hidden_size_,
+            d_o_proj_weight_, total_out, hidden_size_);
+    }
     FA_CUDA_CHECK();
 }
 
